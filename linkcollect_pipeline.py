@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import glob
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -93,6 +94,8 @@ def ensure_schema(db):
     analysis_columns = {row[1] for row in db.execute('PRAGMA table_info(analyses)')}
     if 'ocr_text' not in analysis_columns:
         db.execute("ALTER TABLE analyses ADD COLUMN ocr_text TEXT NOT NULL DEFAULT ''")
+    if 'transcript_cleaned' not in analysis_columns:
+        db.execute("ALTER TABLE analyses ADD COLUMN transcript_cleaned TEXT NOT NULL DEFAULT ''")
     place_columns = {row[1] for row in db.execute('PRAGMA table_info(places)')}
     if 'geocode_status' not in place_columns:
         db.execute("ALTER TABLE places ADD COLUMN geocode_status TEXT NOT NULL DEFAULT 'pending'")
@@ -166,6 +169,23 @@ def api_json(config, endpoint, payload, timeout=90):
         method='POST')
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode('utf-8'))
+
+
+def clean_transcript(config, transcript, source_context=''):
+    """Normalize transcript layout locally without changing words or sending data out."""
+    original = unicodedata.normalize('NFC', str(transcript or '')).replace('\r\n', '\n').replace('\r', '\n')[:30000]
+    if not original.strip():
+        return ''
+    lines = []
+    for line in original.split('\n'):
+        line = re.sub(r'[\t\u00a0 ]+', ' ', line).strip()
+        line = re.sub(r'\s+([,，.。!?！？])', r'\1', line)
+        lines.append(line)
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return '\n'.join(lines)[:30000]
 
 
 def transcribe_audio(audio_path, config):
@@ -456,6 +476,7 @@ def persist_result(db, job, analysis, transcript, config):
     category = str(analysis.get('category') or 'other')[:50]
     summary = text_value(analysis.get('summary'), 12000)
     cleaned = text_value(analysis.get('cleaned_content'), 30000)
+    transcript_cleaned = text_value(analysis.get('transcript_cleaned'), 30000)
     ocr = str(analysis.get('ocr_text') or '')[:20000]
     language = text_value(analysis.get('language'), 40)
     location = analysis.get('location') if isinstance(analysis.get('location'), dict) else None
@@ -467,14 +488,15 @@ def persist_result(db, job, analysis, transcript, config):
     except (TypeError, ValueError):
         confidence = None
     analyzed_at = utc_now()
-    db.execute('''INSERT INTO analyses(job_id,content_type,title,category,summary,cleaned_content,transcript,ocr_text,language,
+    db.execute('''INSERT INTO analyses(job_id,content_type,title,category,summary,cleaned_content,transcript,transcript_cleaned,ocr_text,language,
         location_name,location_address,confidence,model,status,error,analyzed_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
         content_type=excluded.content_type,title=excluded.title,category=excluded.category,summary=excluded.summary,
-        cleaned_content=excluded.cleaned_content,transcript=excluded.transcript,ocr_text=excluded.ocr_text,language=excluded.language,
+        cleaned_content=excluded.cleaned_content,transcript=excluded.transcript,transcript_cleaned=excluded.transcript_cleaned,
+        ocr_text=excluded.ocr_text,language=excluded.language,
         location_name=excluded.location_name,location_address=excluded.location_address,confidence=excluded.confidence,
         model=excluded.model,status=excluded.status,error='',analyzed_at=excluded.analyzed_at''',
-        (job['id'], content_type, title, category, summary, cleaned, transcript[:30000], ocr, language,
+        (job['id'], content_type, title, category, summary, cleaned, transcript[:30000], transcript_cleaned, ocr, language,
          location_name, location_address, confidence, str(analysis.get('model') or '')[:120], 'complete', '', analyzed_at))
     db.execute("UPDATE jobs SET status='analyzed', analysis=?, tags=? WHERE id=?",
                (summary, json.dumps(clean_tags(analysis.get('tags')), ensure_ascii=False), job['id']))
@@ -598,6 +620,12 @@ def analyze_job(job, config):
     try:
         result = request_analysis(config, raw_text, image_paths, frames, transcript, ocr)
         result['transcript'] = transcript
+        try:
+            result['transcript_cleaned'] = clean_transcript(
+                config, transcript,
+                '\n'.join(part for part in (job.get('source_title'), job.get('extracted_caption')) if part))
+        except Exception:
+            result['transcript_cleaned'] = ''
         result['ocr_text'] = ocr
         return result, ''
     finally:

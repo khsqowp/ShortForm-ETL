@@ -85,7 +85,8 @@ def jobs_list():
         rows = db.execute('''SELECT j.id,j.source,j.url,j.text,j.media_name,j.media_type,j.status,j.created_at,
             COALESCE(a.title,'') AS title,COALESCE(a.category,'') AS category,
             COALESCE(a.summary,j.analysis) AS summary,COALESCE(a.cleaned_content,'') AS cleaned_content,
-            COALESCE(a.transcript,'') AS transcript,COALESCE(a.ocr_text,'') AS ocr_text,
+            COALESCE(a.transcript,'') AS transcript,COALESCE(a.transcript_cleaned,'') AS transcript_cleaned,
+            COALESCE(a.ocr_text,'') AS ocr_text,
             COALESCE(j.source_title,'') AS source_title,COALESCE(j.extracted_caption,'') AS extracted_caption,
             COALESCE(a.location_name,'') AS location_name,
             COALESCE(a.location_address,'') AS location_address,COALESCE(a.error,'') AS analysis_error,
@@ -135,6 +136,18 @@ def video_thumbnail_path(job_id, media_path):
     return thumb_path
 
 
+def linked_archive_sources(db, relation_table, relation_key, archive_id):
+    rows = db.execute(f'''SELECT j.id AS job_id,COALESCE(j.url,'') AS url,COALESCE(j.source,'') AS source,
+        COALESCE(NULLIF(j.source_title,''),NULLIF(a.title,''),'') AS title,
+        COALESCE(NULLIF(j.extracted_caption,''),NULLIF(j.text,''),'') AS caption,
+        COALESCE(a.summary,'') AS summary,COALESCE(a.transcript,'') AS transcript,
+        COALESCE(a.transcript_cleaned,'') AS transcript_cleaned,j.created_at
+        FROM {relation_table} s JOIN jobs j ON j.id=s.job_id
+        LEFT JOIN analyses a ON a.job_id=j.id
+        WHERE s.{relation_key}=? ORDER BY j.created_at DESC LIMIT 50''', (archive_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
 def knowledge_list():
     with db_conn() as db:
         rows = db.execute('''SELECT k.id,k.title,k.category,k.summary,k.content,k.language,k.created_at,k.tags AS raw_tags,
@@ -143,6 +156,7 @@ def knowledge_list():
              WHERE s2.knowledge_id=k.id AND j2.media_path!='' ORDER BY j2.created_at DESC LIMIT 1) AS thumbnail_job_id,
             COALESCE(da.cleaned_content,'') AS cleaned_content,
             COALESCE(da.transcript,'') AS transcript,
+            COALESCE(da.transcript_cleaned,'') AS transcript_cleaned,
             COALESCE(da.ocr_text,'') AS ocr_text,
             COALESCE(dj.source_title,'') AS source_title,
             COALESCE(dj.extracted_caption,'') AS extracted_caption
@@ -151,30 +165,36 @@ def knowledge_list():
              WHERE s3.knowledge_id=k.id ORDER BY j3.created_at DESC LIMIT 1)
             LEFT JOIN analyses da ON da.job_id=dj.id
             GROUP BY k.id ORDER BY k.updated_at DESC LIMIT 200''').fetchall()
-    result = []
-    for row in rows:
-        item = dict(row)
-        item['thumbnail_job_id'] = item.get('thumbnail_job_id') or ''
-        raw_tags = item.pop('raw_tags', '') or ''
-        item['tags'] = [tag.strip() for tag in raw_tags.split(',') if tag.strip()]
-        result.append(item)
-    return result
+        result = []
+        for row in rows:
+            item = dict(row)
+            item['thumbnail_job_id'] = item.get('thumbnail_job_id') or ''
+            raw_tags = item.pop('raw_tags', '') or ''
+            item['tags'] = [tag.strip() for tag in raw_tags.split(',') if tag.strip()]
+            item['sources'] = linked_archive_sources(db, 'knowledge_sources', 'knowledge_id', item['id'])
+            result.append(item)
+        return result
 
 
 def places_list():
     with db_conn() as db:
         rows = db.execute('''SELECT p.id,p.name,p.address,p.category,p.latitude,p.longitude,p.naver_map_url,
-            p.created_at,COUNT(s.job_id) AS source_count,
+            p.geocode_status,p.created_at,COUNT(s.job_id) AS source_count,
             (SELECT s2.job_id FROM place_sources s2 JOIN jobs j2 ON j2.id=s2.job_id
              WHERE s2.place_id=p.id AND j2.media_path!='' ORDER BY j2.created_at DESC LIMIT 1) AS thumbnail_job_id
             FROM places p LEFT JOIN place_sources s ON s.place_id=p.id
             GROUP BY p.id ORDER BY p.updated_at DESC LIMIT 200''').fetchall()
-    result = []
-    for row in rows:
-        item = dict(row)
-        item['thumbnail_job_id'] = item.get('thumbnail_job_id') or ''
-        result.append(item)
-    return result
+        result = []
+        for row in rows:
+            item = dict(row)
+            item['thumbnail_job_id'] = item.get('thumbnail_job_id') or ''
+            tag_rows = db.execute('''SELECT DISTINCT t.name FROM place_sources ps
+                JOIN job_tags jt ON jt.job_id=ps.job_id JOIN tags t ON t.id=jt.tag_id
+                WHERE ps.place_id=? ORDER BY t.name''', (item['id'],)).fetchall()
+            item['tags'] = [tag['name'] for tag in tag_rows]
+            item['sources'] = linked_archive_sources(db, 'place_sources', 'place_id', item['id'])
+            result.append(item)
+        return result
 
 
 def telegram_call(token, method, data=None):
@@ -448,6 +468,35 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {'error': 'invalid Content-Length'})
         if length > MAX_UPLOAD:
             return self.json(413, {'error': '요청 파일은 128MB 이하만 허용됩니다'})
+        match = re.fullmatch(r'/api/places/([0-9a-f]{16})/regeocode', path)
+        if match:
+            if length > 4096:
+                return self.json(413, {'error': 'Request is too large'})
+            try:
+                payload = json.loads(self.rfile.read(length) or b'{}')
+            except Exception:
+                return self.json(400, {'error': 'Invalid JSON'})
+            if not isinstance(payload, dict) or not isinstance(payload.get('address'), str):
+                return self.json(400, {'error': 'Address string is required'})
+            address = payload['address'].strip()
+            if not address or len(address) > 500:
+                return self.json(400, {'error': 'Address must be between 1 and 500 characters'})
+            place_id = match.group(1)
+            with db_conn() as db:
+                pipeline.ensure_schema(db)
+                row = db.execute('SELECT id, name FROM places WHERE id=?', (place_id,)).fetchone()
+                if not row:
+                    return self.json(404, {'error': 'Place was not found'})
+                dedupe_hash = pipeline.normalized_hash(row['name'], address)
+                duplicate = db.execute('SELECT id FROM places WHERE dedupe_hash=? AND id<>?',
+                                       (dedupe_hash, place_id)).fetchone()
+                if duplicate:
+                    return self.json(409, {'error': 'A place with the same name and address already exists'})
+                naver_url = 'https://map.naver.com/p/search/' + urllib.parse.quote(address)
+                db.execute("UPDATE places SET address=?, dedupe_hash=?, latitude=NULL, longitude=NULL, geocode_status='pending', geocode_attempted_at='', naver_map_url=?, updated_at=? WHERE id=?",
+                           (address, dedupe_hash, naver_url, pipeline.utc_now(), place_id))
+                db.commit()
+            return self.json(200, {'id': place_id, 'geocode_status': 'pending'})
         if path == '/api/archive/reclassify':
             try:
                 payload = json.loads(self.rfile.read(length) or b'{}')
