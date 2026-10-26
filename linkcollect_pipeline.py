@@ -326,7 +326,7 @@ def request_analysis(config, text, image_paths, video_frames, transcript, ocr=''
         image = image_content(path)
         if image:
             content.append(image)
-    for frame in video_frames[:3]:
+    for frame in video_frames[:8]:
         image = image_content(frame, 'image/jpeg')
         if image:
             content.append(image)
