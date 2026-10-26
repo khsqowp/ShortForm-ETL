@@ -1,0 +1,23 @@
+# Runtime data / generated content — not source
+data/
+tools/*venv*/
+tools/**/venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Manual backup files from pre-git editing sessions
+*.bak-*
+
+# Secrets (defensive — none currently inside this directory, lives in parent)
+.env
+.env.*
+*.key
+*.pem
+
+# Common caches/tooling artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.ipynb_checkpoints/
