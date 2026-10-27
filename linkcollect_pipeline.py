@@ -283,6 +283,17 @@ def extract_video_assets(path, config, local_dir):
     path = Path(path)
     if not path.is_file() or path.stat().st_size > 128 * 1024 * 1024 or not shutil.which('docker'):
         return [], ''
+    fps_filter = 'fps=1/4,mpdecimate,scale=1024:-2'
+    try:
+        duration_result = subprocess.run(
+            [shutil.which('ffprobe') or '/usr/bin/ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True)
+        duration = float(duration_result.stdout.decode('utf-8').strip())
+        if math.isfinite(duration) and duration > 32:
+            fps_filter = 'fps={:.6f},mpdecimate,scale=1024:-2'.format(8 / duration)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
     container = env_value(config, 'LINKCOLLECT_HERMES_CONTAINER', 'hermes')
     work = '/tmp/linkcollect-' + uuid.uuid4().hex
     remote_video = work + '/video' + (path.suffix.lower() or '.mp4')
@@ -295,7 +306,7 @@ def extract_video_assets(path, config, local_dir):
             subprocess.run(command, check=True, timeout=40, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         frames_pattern = work + '/frame-%02d.jpg'
         frame_cmd = ['docker', 'exec', container, 'ffmpeg', '-nostdin', '-v', 'error', '-i', remote_video,
-                     '-vf', 'fps=1/4,mpdecimate,scale=1024:-2', '-frames:v', '8', '-q:v', '5', frames_pattern]
+                     '-vf', fps_filter, '-frames:v', '8', '-q:v', '5', frames_pattern]
         subprocess.run(frame_cmd, check=True, timeout=180, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         frames = []
         for index in range(1, 9):
