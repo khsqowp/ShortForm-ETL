@@ -22,6 +22,8 @@ import urllib.request
 import uuid
 import glob
 import unicodedata
+from difflib import SequenceMatcher
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -253,6 +255,33 @@ def correct_transcript_typos(config, transcript, source_context=''):
         return ''
 
 
+def is_degenerate_transcript(text):
+    text = str(text or '').strip()
+    meaningful = re.sub(r'[\W_]+', '', text, flags=re.UNICODE)
+    if len(meaningful) < 4:
+        return True
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return True
+    normalized = []
+    for line in lines:
+        line = re.sub(r'^\s*(?:\d+\s*[.)、:]\s*)?(?:[📍•\-]+\s*)+', '', line)
+        line = re.sub(r'[\W_]+', '', line, flags=re.UNICODE).lower()
+        if line:
+            normalized.append(line)
+    if len(normalized) >= 3:
+        unique_lines = []
+        for line in normalized:
+            if not any(SequenceMatcher(None, line, existing).ratio() >= 0.78 for existing in unique_lines):
+                unique_lines.append(line)
+        if len(unique_lines) / len(normalized) < 0.65:
+            return True
+    tokens = text.split() if len(lines) == 1 else lines
+    if len(tokens) >= 5 and max(Counter(tokens).values()) / len(tokens) > 0.6:
+        return True
+    return False
+
+
 def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
     if not audio_path:
         return ''
@@ -263,7 +292,8 @@ def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
     script = ('import json,sys,os; from faster_whisper import WhisperModel; '
               'm=WhisperModel(sys.argv[2],device="cpu",compute_type="int8"); '
               'segments,_=m.transcribe(sys.argv[1],**json.loads(sys.argv[3])); '
-              'print(json.dumps([s.text.strip() for s in segments if s.text.strip()],ensure_ascii=False))')
+              'print(json.dumps([{"text":s.text.strip(),"no_speech_prob":getattr(s,"no_speech_prob",None),'
+              '"avg_logprob":getattr(s,"avg_logprob",None)} for s in segments if s.text.strip()],ensure_ascii=False))')
     try:
         env = dict(os.environ)
         env['HF_HOME'] = str(DATA / 'models')
@@ -272,7 +302,30 @@ def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=900, check=False, env=env)
         if proc.returncode == 0:
             result = json.loads(proc.stdout.decode('utf-8'))
-            return '\n'.join(result)[:30000]
+            if result and isinstance(result[0], dict):
+                segments = result
+                texts = [str(segment.get('text') or '').strip() for segment in segments]
+            else:
+                segments = []
+                texts = [str(item).strip() for item in result]
+            transcript = '\n'.join(text for text in texts if text)[:30000]
+            low_confidence = False
+            no_speech = [segment.get('no_speech_prob') for segment in segments if isinstance(segment.get('no_speech_prob'), (int, float))]
+            if no_speech and sum(value > 0.6 for value in no_speech) / len(no_speech) > 0.5:
+                low_confidence = True
+            avg_logprob = [segment.get('avg_logprob') for segment in segments if isinstance(segment.get('avg_logprob'), (int, float))]
+            if avg_logprob and sum(value < -1.0 for value in avg_logprob) / len(avg_logprob) > 0.5:
+                low_confidence = True
+            if transcript and (low_confidence or is_degenerate_transcript(transcript)):
+                try:
+                    log_dir = DATA / 'logs'
+                    os.makedirs(log_dir, mode=0o700, exist_ok=True)
+                    with open(log_dir / 'stt_debug.log', 'a', encoding='utf-8') as audit:
+                        audit.write('{} flagged transcript: {}\n'.format(utc_now(), transcript.replace('\n', '\\n')))
+                except OSError:
+                    pass
+                return ''
+            return transcript
     except (OSError, subprocess.SubprocessError, ValueError):
         return ''
     return ''
@@ -282,7 +335,17 @@ def extract_video_assets(path, config, local_dir):
     """Use the already-installed ffmpeg in the Hermes container without copying media elsewhere."""
     path = Path(path)
     if not path.is_file() or path.stat().st_size > 128 * 1024 * 1024 or not shutil.which('docker'):
-        return [], ''
+        return [], '', False
+    has_audio_stream = True
+    ffprobe = shutil.which('ffprobe')
+    if ffprobe:
+        try:
+            audio_probe = subprocess.run(
+                [ffprobe, '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', str(path)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True)
+            has_audio_stream = bool(audio_probe.stdout.decode('utf-8').strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
     fps_filter = 'fps=1/4,mpdecimate,scale=1024:-2'
     try:
         duration_result = subprocess.run(
@@ -330,9 +393,9 @@ def extract_video_assets(path, config, local_dir):
                 audio_path = ''
         else:
             audio_path = ''
-        return frames, audio_path
+        return frames, audio_path, has_audio_stream
     except (OSError, subprocess.SubprocessError):
-        return [], ''
+        return [], '', has_audio_stream
     finally:
         subprocess.run(['docker', 'exec', container, 'rm', '-rf', work],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=False)
@@ -819,12 +882,14 @@ def analyze_job(job, config):
         full_path = Path(os.environ.get('LINKCOLLECT_DATA_DIR', str(Path(__file__).resolve().parent / 'data'))) / media_path
         if job.get('media_type') == 'video' or full_path.suffix.lower() in ('.mp4', '.mov', '.m4v', '.webm'):
             is_video_source = True
-            frames, audio_path = extract_video_assets(full_path, config, temporary.name)
+            frames, audio_path, has_audio_stream = extract_video_assets(full_path, config, temporary.name)
             if not frames:
                 temporary.cleanup()
                 return None, '영상 프레임 추출에 실패했습니다. 원격 미디어 도구 상태와 영상 형식을 확인해야 합니다.'
-            speech = transcribe_audio(audio_path, config) if audio_path else ''
+            speech = transcribe_audio(audio_path, config) if has_audio_stream and audio_path else ''
             transcript = '\n'.join(part for part in (transcript, speech) if part)[:30000]
+            if is_degenerate_transcript(transcript):
+                transcript = ''
         elif job.get('media_type', '').startswith('image') or full_path.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp', '.gif'):
             carousel_paths = job.get('carousel_media_paths') or []
             if isinstance(carousel_paths, str):
@@ -872,7 +937,7 @@ def analyze_job(job, config):
                 if candidate and candidate.strip() not in (transcript.strip(), *(x.strip() for x in retry_texts)):
                     retry_texts.append(candidate.strip())
             merged = '\n'.join(x for x in [transcript.strip(), *retry_texts] if x)[:30000]
-            if merged and merged != transcript:
+            if merged and not is_degenerate_transcript(merged) and merged != transcript:
                 transcript = merged
                 result = request_analysis(config, raw_text, image_paths, frames, transcript, ocr)
         result['transcript'] = transcript
