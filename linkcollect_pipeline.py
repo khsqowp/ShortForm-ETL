@@ -43,6 +43,8 @@ def ensure_schema(db):
         db.execute("ALTER TABLE jobs ADD COLUMN analysis_attempts INTEGER NOT NULL DEFAULT 0")
     if 'reclassify_hint' not in job_columns:
         db.execute("ALTER TABLE jobs ADD COLUMN reclassify_hint TEXT NOT NULL DEFAULT ''")
+    if 'carousel_media_paths' not in job_columns:
+        db.execute("ALTER TABLE jobs ADD COLUMN carousel_media_paths TEXT NOT NULL DEFAULT '[]'")
     db.executescript('''
     CREATE TABLE IF NOT EXISTS analyses (
       job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
@@ -54,6 +56,7 @@ def ensure_schema(db):
       location_name TEXT NOT NULL DEFAULT '', location_address TEXT NOT NULL DEFAULT '',
       confidence REAL, model TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT 'waiting_ai', error TEXT NOT NULL DEFAULT '',
+      completeness_note TEXT NOT NULL DEFAULT '',
       analyzed_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS knowledge_items (
@@ -94,6 +97,8 @@ def ensure_schema(db):
     CREATE INDEX IF NOT EXISTS idx_analyses_status ON analyses(status);
     ''')
     analysis_columns = {row[1] for row in db.execute('PRAGMA table_info(analyses)')}
+    if 'completeness_note' not in analysis_columns:
+        db.execute("ALTER TABLE analyses ADD COLUMN completeness_note TEXT NOT NULL DEFAULT ''")
     if 'ocr_text' not in analysis_columns:
         db.execute("ALTER TABLE analyses ADD COLUMN ocr_text TEXT NOT NULL DEFAULT ''")
     if 'transcript_cleaned' not in analysis_columns:
@@ -122,6 +127,12 @@ def ensure_schema(db):
     if 'tags' not in knowledge_columns:
         db.execute("ALTER TABLE knowledge_items ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
     db.commit()
+
+
+def declared_count_hint(text):
+    counts = [int(match) for match in re.findall(r'(\d{1,3})\s*(?:곳|개)', str(text or ''))]
+    counts = [count for count in counts if 1 <= count <= 200]
+    return max(counts) if counts else 0
 
 
 def env_value(config, key, default=''):
@@ -502,7 +513,7 @@ def download_public_post(job, config):
     video_exts = ('.mp4', '.mov', '.m4v', '.webm', '.mkv')
     image_exts = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
     videos = [p for p in candidates if p.suffix.lower() in video_exts]
-    images = [p for p in candidates if p.suffix.lower() in image_exts]
+    images = sorted((p for p in candidates if p.suffix.lower() in image_exts), key=lambda p: p.name)
     candidates = videos or images
     candidates.sort(key=lambda p: p.name)
     if not candidates:
@@ -511,9 +522,12 @@ def download_public_post(job, config):
     title = str(info.get('title') or '')[:300]
     caption = str(info.get('description') or '')[:20000]
     mime = mimetypes.guess_type(media.name)[0] or 'application/octet-stream'
-    return {'media_path': str(media.relative_to(DATA)), 'media_name': media.name,
+    result = {'media_path': str(media.relative_to(DATA)), 'media_name': media.name,
             'media_type': mime, 'source_title': title, 'extracted_caption': caption,
-            'subtitle_text': subtitle_text}, ''
+            'subtitle_text': subtitle_text}
+    if images and not videos and len(images) > 1:
+        result['carousel_media_paths'] = [str(path.relative_to(DATA)) for path in images]
+    return result, ''
 
 
 def naver_geocode(config, address, name=''):
@@ -593,17 +607,33 @@ def persist_result(db, job, analysis, transcript, config):
     except (TypeError, ValueError):
         confidence = None
     analyzed_at = utc_now()
+    declared = declared_count_hint(' '.join(str(value or '') for value in (
+        job.get('source_title'), job.get('extracted_caption'), job.get('text'), ocr,
+        transcript, cleaned)))
+    if structure_type == 'place_list':
+        places_for_count = analysis.get('places') if isinstance(analysis.get('places'), list) else []
+        extracted_count = sum(1 for item in places_for_count if isinstance(item, dict) and text_value(item.get('name'), 300).strip())
+        if extracted_count == 0 and location_name:
+            extracted_count = 1
+    elif structure_type in ('ranked_table', 'multi_item_list'):
+        list_count = len(re.findall(r'(?m)^(?:[-*+]\s+|\d+[.)]\s+)', cleaned))
+        table_rows = [line for line in cleaned.splitlines() if line.strip().startswith('|') and line.strip().endswith('|')]
+        table_rows = [line for line in table_rows if not re.fullmatch(r'\s*\|?[\s:|\-]+\|?\s*', line)]
+        extracted_count = max(list_count, max(0, len(table_rows) - 1) if table_rows else 0)
+    else:
+        extracted_count = 0
+    completeness_note = '선언 {}, 확인 {}'.format(declared, extracted_count) if declared and extracted_count < 0.7 * declared and declared - extracted_count >= 2 else ''
     db.execute('''INSERT INTO analyses(job_id,content_type,title,category,summary,cleaned_content,structure_type,transcript,transcript_cleaned,stt_corrected_text,ocr_text,language,
-        location_name,location_address,confidence,model,status,error,analyzed_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
+        location_name,location_address,confidence,model,status,error,completeness_note,analyzed_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
         content_type=excluded.content_type,title=excluded.title,category=excluded.category,summary=excluded.summary,
         cleaned_content=excluded.cleaned_content,structure_type=excluded.structure_type,transcript=excluded.transcript,transcript_cleaned=excluded.transcript_cleaned,
         stt_corrected_text=excluded.stt_corrected_text,
         ocr_text=excluded.ocr_text,language=excluded.language,
         location_name=excluded.location_name,location_address=excluded.location_address,confidence=excluded.confidence,
-        model=excluded.model,status=excluded.status,error='',analyzed_at=excluded.analyzed_at''',
+        model=excluded.model,status=excluded.status,error='',completeness_note=excluded.completeness_note,analyzed_at=excluded.analyzed_at''',
         (job['id'], content_type, title, category, summary, cleaned, structure_type, transcript[:30000], transcript_cleaned, stt_corrected_text, ocr, language,
-         location_name, location_address, confidence, str(analysis.get('model') or '')[:120], 'complete', '', analyzed_at))
+         location_name, location_address, confidence, str(analysis.get('model') or '')[:120], 'complete', '', completeness_note, analyzed_at))
     db.execute("UPDATE jobs SET status='analyzed', analysis=?, tags=? WHERE id=?",
                (summary, json.dumps(clean_tags(analysis.get('tags')), ensure_ascii=False), job['id']))
     if content_type in ('information', 'mixed') and structure_type != 'place_list':
@@ -760,9 +790,23 @@ def analyze_job(job, config):
             speech = transcribe_audio(audio_path, config) if audio_path else ''
             transcript = '\n'.join(part for part in (transcript, speech) if part)[:30000]
         elif job.get('media_type', '').startswith('image') or full_path.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp', '.gif'):
-            if not image_content(full_path):
+            carousel_paths = job.get('carousel_media_paths') or []
+            if isinstance(carousel_paths, str):
+                try:
+                    carousel_paths = json.loads(carousel_paths)
+                except ValueError:
+                    carousel_paths = []
+            if carousel_paths:
+                image_paths = [Path(os.environ.get('LINKCOLLECT_DATA_DIR', str(Path(__file__).resolve().parent / 'data'))) / path for path in carousel_paths]
+            else:
+                image_paths.append(full_path)
+            if len(image_paths) > 10:
+                total = len(image_paths)
+                indices = [round(i * (total - 1) / 9) for i in range(10)]
+                image_paths = [image_paths[index] for index in indices]
+            image_paths = [path for path in image_paths if image_content(path)]
+            if not image_paths:
                 return None, '이미지가 없거나 8MB 분석 제한을 초과했습니다. 파일을 줄여 다시 접수해야 합니다.'
-            image_paths.append(full_path)
     raw_text = '\n\n'.join(part for part in (
         str(job.get('source_title') or '').strip(),
         str(job.get('extracted_caption') or '').strip(),
@@ -851,9 +895,9 @@ def process_one(app_module, job_id):
                 return 'download_failed'
             subtitle_text = download.get('subtitle_text') or ''
             with app_module.db_conn() as db:
-                db.execute('''UPDATE jobs SET media_path=?,media_name=?,media_type=?,source_title=?,extracted_caption=? WHERE id=?''',
+                db.execute('''UPDATE jobs SET media_path=?,media_name=?,media_type=?,source_title=?,extracted_caption=?,carousel_media_paths=? WHERE id=?''',
                     (download['media_path'], download['media_name'], download['media_type'],
-                     download['source_title'], download['extracted_caption'], job_id))
+                     download['source_title'], download['extracted_caption'], json.dumps(download.get('carousel_media_paths') or [], ensure_ascii=False), job_id))
             job.update(download)
         stage = 'analysis'
         analysis, waiting_reason = analyze_job(job, app_module.load_env())
