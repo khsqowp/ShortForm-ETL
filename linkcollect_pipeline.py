@@ -8,6 +8,7 @@ items remain safely stored and queued for analysis.
 import base64
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
@@ -406,7 +407,16 @@ def normalized_hash(*parts):
 
 
 def place_name_key(value):
-    return re.sub(r'\s+', '', str(value or '')).casefold()
+    value = re.sub(r'[\(（\[【][^\)）\]】]*[\)）\]】]', '', str(value or ''))
+    return re.sub(r'\s+', '', value).casefold()
+
+
+def haversine_meters(lat1, lon1, lat2, lon2):
+    radius = 6371000
+    lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    value = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 2 * radius * math.atan2(math.sqrt(value), math.sqrt(1 - value))
 
 
 def place_address_tokens(value):
@@ -703,6 +713,7 @@ def persist_result(db, job, analysis, transcript, config):
         analysis['summary'] = summary
         db.execute('UPDATE analyses SET summary=? WHERE job_id=?', (summary, job['id']))
         db.execute('UPDATE jobs SET analysis=? WHERE id=?', (summary, job['id']))
+    previous_place_ids = [row['place_id'] for row in db.execute('SELECT place_id FROM place_sources WHERE job_id=?', (job['id'],)).fetchall()]
     db.execute('DELETE FROM place_sources WHERE job_id=?', (job['id'],))
     if place_candidates:
         for place_name, place_address, place_category in place_candidates:
@@ -718,11 +729,20 @@ def persist_result(db, job, analysis, transcript, config):
                 # existing place instead of spawning a duplicate row.
                 name_key = place_name_key(place_name)
                 addr_tokens = place_address_tokens(place_address)
-                for candidate in db.execute('SELECT id,name,address,latitude,longitude,geocode_status FROM places').fetchall():
+                for previous_id in previous_place_ids:
+                    candidate = db.execute('SELECT id,name,address,latitude,longitude,geocode_status FROM places WHERE id=?', (previous_id,)).fetchone()
+                    if candidate and place_name_key(candidate['name']) == name_key:
+                        existing = candidate
+                        break
+                for candidate in (() if existing else db.execute('SELECT id,name,address,latitude,longitude,geocode_status FROM places').fetchall()):
                     if place_name_key(candidate['name']) != name_key:
                         continue
                     candidate_tokens = place_address_tokens(candidate['address'])
-                    if not addr_tokens or not candidate_tokens or (addr_tokens & candidate_tokens):
+                    address_overlap = not addr_tokens or not candidate_tokens or bool(addr_tokens & candidate_tokens)
+                    coords_overlap = (coords and candidate['latitude'] is not None and candidate['longitude'] is not None
+                                      and haversine_meters(candidate['latitude'], candidate['longitude'], coords[0], coords[1]) <= 50
+                                      and (place_name_key(candidate['name']) == name_key or bool(addr_tokens & candidate_tokens)))
+                    if address_overlap or coords_overlap:
                         existing = candidate
                         break
             if existing:
