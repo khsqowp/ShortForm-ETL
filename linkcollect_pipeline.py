@@ -601,6 +601,11 @@ def persist_result(db, job, analysis, transcript, config):
     location = analysis.get('location') if isinstance(analysis.get('location'), dict) else None
     location_name = str((location or {}).get('name') or '')[:300]
     location_address = str((location or {}).get('address') or '')[:500]
+    empty_result = not any(value.strip() for value in (
+        title if title.strip() != '제목 없음' else '', summary, cleaned, ocr,
+        str(transcript or ''), transcript_cleaned, location_name))
+    result_status = 'needs_review' if empty_result else 'complete'
+    job_status = 'needs_review' if empty_result else 'analyzed'
     confidence = analysis.get('confidence')
     try:
         confidence = max(0.0, min(1.0, float(confidence))) if confidence is not None else None
@@ -633,9 +638,9 @@ def persist_result(db, job, analysis, transcript, config):
         location_name=excluded.location_name,location_address=excluded.location_address,confidence=excluded.confidence,
         model=excluded.model,status=excluded.status,error='',completeness_note=excluded.completeness_note,analyzed_at=excluded.analyzed_at''',
         (job['id'], content_type, title, category, summary, cleaned, structure_type, transcript[:30000], transcript_cleaned, stt_corrected_text, ocr, language,
-         location_name, location_address, confidence, str(analysis.get('model') or '')[:120], 'complete', '', completeness_note, analyzed_at))
-    db.execute("UPDATE jobs SET status='analyzed', analysis=?, tags=? WHERE id=?",
-               (summary, json.dumps(clean_tags(analysis.get('tags')), ensure_ascii=False), job['id']))
+         location_name, location_address, confidence, str(analysis.get('model') or '')[:120], result_status, '', completeness_note, analyzed_at))
+    db.execute("UPDATE jobs SET status=?, analysis=?, tags=? WHERE id=?",
+               (job_status, summary, json.dumps(clean_tags(analysis.get('tags')), ensure_ascii=False), job['id']))
     if content_type in ('information', 'mixed') and structure_type != 'place_list':
         new_tags = clean_tags(analysis.get('tags'))
         source_text = cleaned or summary or job['text']
@@ -876,7 +881,10 @@ def process_one(app_module, job_id):
         if job.get('url') and not job.get('media_path'):
             download, download_error = download_public_post(job, app_module.load_env())
             if download is None:
-                if job.get('text'):
+                text_caption = str(job.get('text') or '').strip()
+                job_url = str(job.get('url') or '').strip()
+                caption_remainder = text_caption.replace(job_url, '').strip() if job_url else text_caption
+                if text_caption and caption_remainder:
                     job['source_title'] = ''
                     job['extracted_caption'] = job.get('text')
                     job['subtitle_text'] = ''
