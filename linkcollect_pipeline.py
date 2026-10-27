@@ -505,7 +505,7 @@ def naver_geocode(config, address, name=''):
         query = re.sub(r'\s+', ' ', query).strip()
         if not query:
             continue
-        url = 'https://naveropenapi.apigw.ntruss.com/map-geocode/v2/geocode?' + urllib.parse.urlencode({'query': query})
+        url = 'https://maps.apigw.ntruss.com/map-geocode/v2/geocode?' + urllib.parse.urlencode({'query': query})
         req = urllib.request.Request(url, headers={
             'Accept': 'application/json', 'x-ncp-apigw-api-key-id': key_id,
             'x-ncp-apigw-api-key': key})
