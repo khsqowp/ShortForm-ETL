@@ -355,6 +355,14 @@ def normalized_hash(*parts):
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
 
+def place_name_key(value):
+    return re.sub(r'\s+', '', str(value or '')).casefold()
+
+
+def place_address_tokens(value):
+    return set(re.findall(r'[0-9a-z가-힣]+', str(value or '').casefold()))
+
+
 def clean_tags(tags):
     out, seen = [], set()
     if not isinstance(tags, list):
@@ -627,15 +635,29 @@ def persist_result(db, job, analysis, transcript, config):
             digest = normalized_hash(place_name, place_address)
             naver_url = 'https://map.naver.com/p/search/' + urllib.parse.quote(address)
             existing = db.execute('SELECT id,latitude,longitude,geocode_status FROM places WHERE dedupe_hash=?', (digest,)).fetchone()
+            if not existing:
+                # Exact-hash lookup misses when the AI rephrases a vague region string between
+                # re-analyses of the same venue (e.g. "잠실" vs "잠실·송파"). Fall back to a
+                # same-name match with overlapping address tokens so re-analysis updates the
+                # existing place instead of spawning a duplicate row.
+                name_key = place_name_key(place_name)
+                addr_tokens = place_address_tokens(place_address)
+                for candidate in db.execute('SELECT id,name,address,latitude,longitude,geocode_status FROM places').fetchall():
+                    if place_name_key(candidate['name']) != name_key:
+                        continue
+                    candidate_tokens = place_address_tokens(candidate['address'])
+                    if not addr_tokens or not candidate_tokens or (addr_tokens & candidate_tokens):
+                        existing = candidate
+                        break
             if existing:
                 place_id = existing['id']
                 if coords:
-                    db.execute("UPDATE places SET name=?,address=?,latitude=?,longitude=?,geocode_status='resolved',geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
-                               (place_name, place_address, coords[0], coords[1], analyzed_at, naver_url, analyzed_at, place_id))
+                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,latitude=?,longitude=?,geocode_status='resolved',geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
+                               (place_name, place_address, digest, coords[0], coords[1], analyzed_at, naver_url, analyzed_at, place_id))
                 else:
                     status = 'resolved' if existing['latitude'] is not None and existing['longitude'] is not None else 'no_result'
-                    db.execute("UPDATE places SET name=?,address=?,geocode_status=?,geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
-                               (place_name, place_address, status, analyzed_at, naver_url, analyzed_at, place_id))
+                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,geocode_status=?,geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
+                               (place_name, place_address, digest, status, analyzed_at, naver_url, analyzed_at, place_id))
             else:
                 place_id = uuid.uuid4().hex[:16]
                 db.execute('''INSERT INTO places(id,dedupe_hash,name,address,category,latitude,longitude,geocode_status,geocode_attempted_at,map_provider,naver_map_url,created_at,updated_at)
