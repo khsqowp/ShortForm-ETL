@@ -86,6 +86,7 @@ def jobs_list():
             COALESCE(a.title,'') AS title,COALESCE(a.category,'') AS category,
             COALESCE(a.summary,j.analysis) AS summary,COALESCE(a.cleaned_content,'') AS cleaned_content,
             COALESCE(a.transcript,'') AS transcript,COALESCE(a.transcript_cleaned,'') AS transcript_cleaned,
+            COALESCE(a.stt_corrected_text,'') AS stt_corrected_text,
             COALESCE(a.ocr_text,'') AS ocr_text,
             COALESCE(j.source_title,'') AS source_title,COALESCE(j.extracted_caption,'') AS extracted_caption,
             COALESCE(a.location_name,'') AS location_name,
@@ -141,7 +142,7 @@ def linked_archive_sources(db, relation_table, relation_key, archive_id):
         COALESCE(NULLIF(j.source_title,''),NULLIF(a.title,''),'') AS title,
         COALESCE(NULLIF(j.extracted_caption,''),NULLIF(j.text,''),'') AS caption,
         COALESCE(a.summary,'') AS summary,COALESCE(a.transcript,'') AS transcript,
-        COALESCE(a.transcript_cleaned,'') AS transcript_cleaned,j.created_at
+        COALESCE(a.transcript_cleaned,'') AS transcript_cleaned,COALESCE(a.stt_corrected_text,'') AS stt_corrected_text,j.created_at
         FROM {relation_table} s JOIN jobs j ON j.id=s.job_id
         LEFT JOIN analyses a ON a.job_id=j.id
         WHERE s.{relation_key}=? ORDER BY j.created_at DESC LIMIT 50''', (archive_id,)).fetchall()
@@ -157,6 +158,7 @@ def knowledge_list():
             COALESCE(da.cleaned_content,'') AS cleaned_content,
             COALESCE(da.transcript,'') AS transcript,
             COALESCE(da.transcript_cleaned,'') AS transcript_cleaned,
+            COALESCE(da.stt_corrected_text,'') AS stt_corrected_text,
             COALESCE(da.ocr_text,'') AS ocr_text,
             COALESCE(dj.source_title,'') AS source_title,
             COALESCE(dj.extracted_caption,'') AS extracted_caption
