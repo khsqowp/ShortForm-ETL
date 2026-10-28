@@ -282,6 +282,25 @@ def is_degenerate_transcript(text):
     return False
 
 
+def _meaningful_transcript_tokens(text):
+    stopwords = {
+        '은', '는', '이', '가', '을', '를', '의', '에', '에서', '으로', '로', '와', '과',
+        '도', '만', '이나', '나', '하다', '있다', '것', '수', '등', '그', '저', '이거',
+        '거기', '여기',
+    }
+    return {token.casefold() for token in re.findall(r'[가-힣A-Za-z0-9]+', str(text or ''))
+            if len(token) >= 2 and not token.isdigit() and token.casefold() not in stopwords}
+
+
+def is_offtopic_transcript(transcript, reference_text):
+    transcript_tokens = _meaningful_transcript_tokens(transcript)
+    if len(transcript_tokens) < 5:
+        return False
+    reference_tokens = _meaningful_transcript_tokens(reference_text)
+    overlap = len(transcript_tokens & reference_tokens) / len(transcript_tokens)
+    return overlap < 0.005
+
+
 def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
     if not audio_path:
         return ''
@@ -838,6 +857,12 @@ def persist_result(db, job, analysis, transcript, config):
         db.execute('INSERT OR IGNORE INTO tags(name) VALUES(?)', (tag,))
         tag_id = db.execute('SELECT id FROM tags WHERE name=?', (tag,)).fetchone()['id']
         db.execute('INSERT OR IGNORE INTO job_tags(job_id,tag_id) VALUES(?,?)', (job['id'], tag_id))
+    current_place_ids = {row['place_id'] for row in db.execute(
+        'SELECT place_id FROM place_sources WHERE job_id=?', (job['id'],)).fetchall()}
+    for previous_id in set(previous_place_ids) - current_place_ids:
+        db.execute('''DELETE FROM places WHERE id=?
+                      AND NOT EXISTS (SELECT 1 FROM place_sources WHERE place_id=?)''',
+                   (previous_id, previous_id))
 
 
 def resolve_pending_places(config):
@@ -888,8 +913,6 @@ def analyze_job(job, config):
                 return None, '영상 프레임 추출에 실패했습니다. 원격 미디어 도구 상태와 영상 형식을 확인해야 합니다.'
             speech = transcribe_audio(audio_path, config) if has_audio_stream and audio_path else ''
             transcript = '\n'.join(part for part in (transcript, speech) if part)[:30000]
-            if is_degenerate_transcript(transcript):
-                transcript = ''
         elif job.get('media_type', '').startswith('image') or full_path.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp', '.gif'):
             carousel_paths = job.get('carousel_media_paths') or []
             if isinstance(carousel_paths, str):
@@ -915,6 +938,9 @@ def analyze_job(job, config):
     if job.get('url'):
         raw_text = (raw_text + '\n\n원문 링크(페이지 내용은 직접 가져오지 않음): ' + job['url']).strip()
     ocr = ocr_text(image_paths + frames)
+    reference_text = '\n'.join(part for part in (raw_text, ocr) if part)
+    if transcript and (is_degenerate_transcript(transcript) or is_offtopic_transcript(transcript, reference_text)):
+        transcript = ''
     hint = job.get('reclassify_hint') or ''
     if hint == 'place':
         raw_text = (raw_text + '\n\n[사용자 재분류 요청] 이 콘텐츠는 장소(맛집/놀거리 등) 정보로 재분류해야 한다. '
@@ -937,7 +963,8 @@ def analyze_job(job, config):
                 if candidate and candidate.strip() not in (transcript.strip(), *(x.strip() for x in retry_texts)):
                     retry_texts.append(candidate.strip())
             merged = '\n'.join(x for x in [transcript.strip(), *retry_texts] if x)[:30000]
-            if merged and not is_degenerate_transcript(merged) and merged != transcript:
+            if (merged and not is_degenerate_transcript(merged)
+                    and not is_offtopic_transcript(merged, reference_text) and merged != transcript):
                 transcript = merged
                 result = request_analysis(config, raw_text, image_paths, frames, transcript, ocr)
         result['transcript'] = transcript
