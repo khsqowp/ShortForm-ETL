@@ -311,7 +311,7 @@ def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
     whisper_python = env_value(config, 'LINKCOLLECT_WHISPER_PYTHON',
         '/home/opc/My_Archive/TELEGRAM_KHSQOWP_LinkCollectbot/tools/yt-dlp-venv/bin/python')
     model = env_value(config, 'LINKCOLLECT_WHISPER_MODEL', 'small')
-    options = {'beam_size': 5, 'vad_filter': True, 'language': 'ko', 'initial_prompt': initial_prompt[:800]} if retry else {'beam_size': 5, 'vad_filter': True, 'language': 'ko'}
+    options = {'beam_size': 5, 'vad_filter': True, 'initial_prompt': initial_prompt[:800]} if retry else {'beam_size': 5, 'vad_filter': True}
     script = ('import json,sys,os; from faster_whisper import WhisperModel; '
               'm=WhisperModel(sys.argv[2],device="cpu",compute_type="int8"); '
               'segments,_=m.transcribe(sys.argv[1],**json.loads(sys.argv[3])); '
