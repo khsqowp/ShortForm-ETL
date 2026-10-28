@@ -597,7 +597,7 @@ def text_value(value, limit):
 
 
 SUPPORTED_HOSTS = {
-    'instagram.com', 'tiktok.com', 'youtube.com', 'youtu.be', 'x.com', 'twitter.com', 'threads.net'
+    'instagram.com', 'tiktok.com', 'youtube.com', 'youtu.be', 'x.com', 'twitter.com', 'threads.net', 'threads.com'
 }
 
 
