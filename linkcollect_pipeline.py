@@ -441,13 +441,62 @@ def ocr_text(image_paths):
 
 def image_content(path, mime_type=None):
     path = Path(path)
-    if not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
+    if not path.is_file():
         return None
+    max_size = 8 * 1024 * 1024
+    original_size = path.stat().st_size
     mime = mime_type or mimetypes.guess_type(path.name)[0] or 'image/jpeg'
     if not mime.startswith('image/'):
         mime = 'image/jpeg'
-    encoded = base64.b64encode(path.read_bytes()).decode('ascii')
-    return {'type': 'image_url', 'image_url': {'url': 'data:{};base64,{}'.format(mime, encoded), 'detail': 'low'}}
+    if original_size <= max_size:
+        encoded = base64.b64encode(path.read_bytes()).decode('ascii')
+        return {'type': 'image_url', 'image_url': {'url': 'data:{};base64,{}'.format(mime, encoded), 'detail': 'low'}}
+
+    # Oversized: don't silently drop the image, try to downscale/recompress
+    # it under the limit with ffmpeg instead of excluding it from the AI
+    # request outright.
+    resized_bytes = None
+    resized_size = None
+    for width, quality in ((1600, 5), (1200, 7), (800, 9)):
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
+                temp_path = Path(temp_file.name)
+            subprocess.run(
+                ['ffmpeg', '-y', '-i', str(path), '-vf', 'scale={width}:-2'.format(width=width),
+                 '-frames:v', '1', '-q:v', str(quality), str(temp_path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
+            candidate_size = temp_path.stat().st_size
+            if candidate_size <= max_size:
+                resized_bytes = temp_path.read_bytes()
+                resized_size = candidate_size
+                break
+        except (OSError, subprocess.SubprocessError):
+            continue
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+    try:
+        log_dir = DATA / 'logs'
+        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        with open(log_dir / 'image_resize.log', 'a', encoding='utf-8') as audit:
+            if resized_bytes is not None:
+                audit.write('{} resized image: path={} original_size={} resized_size={}\n'.format(
+                    utc_now(), path, original_size, resized_size))
+            else:
+                audit.write('{} excluded oversized image: path={} original_size={} resize_failed\n'.format(
+                    utc_now(), path, original_size))
+    except OSError:
+        pass
+
+    if resized_bytes is None:
+        return None
+    encoded = base64.b64encode(resized_bytes).decode('ascii')
+    return {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,{}'.format(encoded), 'detail': 'low'}}
 
 
 def request_analysis(config, text, image_paths, video_frames, transcript, ocr=''):
