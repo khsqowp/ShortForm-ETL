@@ -87,6 +87,7 @@ def jobs_list():
             COALESCE(a.summary,j.analysis) AS summary,COALESCE(a.cleaned_content,'') AS cleaned_content,
             COALESCE(a.transcript,'') AS transcript,COALESCE(a.transcript_cleaned,'') AS transcript_cleaned,
             COALESCE(a.stt_corrected_text,'') AS stt_corrected_text,
+            COALESCE(a.native_subtitle_text,'') AS native_subtitle_text,COALESCE(a.transcript_segments,'') AS transcript_segments,
             COALESCE(a.ocr_text,'') AS ocr_text,
             COALESCE(j.source_title,'') AS source_title,COALESCE(j.extracted_caption,'') AS extracted_caption,
             COALESCE(a.location_name,'') AS location_name,
@@ -96,6 +97,10 @@ def jobs_list():
     result = []
     for row in rows:
         item = dict(row)
+        try:
+            item['transcript_segments'] = json.loads(item.get('transcript_segments') or '[]')
+        except (TypeError, ValueError):
+            item['transcript_segments'] = []
         try:
             item['tags'] = json.loads(item.pop('tag_list') or '[]')
         except (TypeError, ValueError):
@@ -142,11 +147,19 @@ def linked_archive_sources(db, relation_table, relation_key, archive_id):
         COALESCE(NULLIF(j.source_title,''),NULLIF(a.title,''),'') AS title,
         COALESCE(NULLIF(j.extracted_caption,''),NULLIF(j.text,''),'') AS caption,
         COALESCE(a.summary,'') AS summary,COALESCE(a.transcript,'') AS transcript,
-        COALESCE(a.transcript_cleaned,'') AS transcript_cleaned,COALESCE(a.stt_corrected_text,'') AS stt_corrected_text,j.created_at
+        COALESCE(a.transcript_cleaned,'') AS transcript_cleaned,COALESCE(a.stt_corrected_text,'') AS stt_corrected_text,COALESCE(a.native_subtitle_text,'') AS native_subtitle_text,COALESCE(a.transcript_segments,'') AS transcript_segments,j.created_at
         FROM {relation_table} s JOIN jobs j ON j.id=s.job_id
         LEFT JOIN analyses a ON a.job_id=j.id
         WHERE s.{relation_key}=? ORDER BY j.created_at DESC LIMIT 50''', (archive_id,)).fetchall()
-    return [dict(row) for row in rows]
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item['transcript_segments'] = json.loads(item.get('transcript_segments') or '[]')
+        except (TypeError, ValueError):
+            item['transcript_segments'] = []
+        result.append(item)
+    return result
 
 
 def knowledge_list():
@@ -159,6 +172,7 @@ def knowledge_list():
             COALESCE(da.transcript,'') AS transcript,
             COALESCE(da.transcript_cleaned,'') AS transcript_cleaned,
             COALESCE(da.stt_corrected_text,'') AS stt_corrected_text,
+            COALESCE(da.native_subtitle_text,'') AS native_subtitle_text, COALESCE(da.transcript_segments,'') AS transcript_segments,
             COALESCE(da.ocr_text,'') AS ocr_text,
             COALESCE(dj.source_title,'') AS source_title,
             COALESCE(dj.extracted_caption,'') AS extracted_caption
@@ -170,6 +184,10 @@ def knowledge_list():
         result = []
         for row in rows:
             item = dict(row)
+            try:
+                item['transcript_segments'] = json.loads(item.get('transcript_segments') or '[]')
+            except (TypeError, ValueError):
+                item['transcript_segments'] = []
             item['thumbnail_job_id'] = item.get('thumbnail_job_id') or ''
             raw_tags = item.pop('raw_tags', '') or ''
             item['tags'] = [tag.strip() for tag in raw_tags.split(',') if tag.strip()]

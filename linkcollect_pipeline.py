@@ -110,6 +110,10 @@ def ensure_schema(db):
         db.execute("ALTER TABLE analyses ADD COLUMN stt_corrected_text TEXT NOT NULL DEFAULT ''")
     if 'structure_type' not in analysis_columns:
         db.execute("ALTER TABLE analyses ADD COLUMN structure_type TEXT NOT NULL DEFAULT 'single_topic'")
+    if 'native_subtitle_text' not in analysis_columns:
+        db.execute("ALTER TABLE analyses ADD COLUMN native_subtitle_text TEXT NOT NULL DEFAULT ''")
+    if 'transcript_segments' not in analysis_columns:
+        db.execute("ALTER TABLE analyses ADD COLUMN transcript_segments TEXT NOT NULL DEFAULT ''")
     # Allow one source job to link to multiple places.
     unique_job_only = False
     for index in db.execute('PRAGMA index_list(place_sources)').fetchall():
@@ -303,7 +307,7 @@ def is_offtopic_transcript(transcript, reference_text):
 
 def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
     if not audio_path:
-        return ''
+        return '', []
     whisper_python = env_value(config, 'LINKCOLLECT_WHISPER_PYTHON',
         '/home/opc/My_Archive/TELEGRAM_KHSQOWP_LinkCollectbot/tools/yt-dlp-venv/bin/python')
     model = env_value(config, 'LINKCOLLECT_WHISPER_MODEL', 'small')
@@ -312,7 +316,7 @@ def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
               'm=WhisperModel(sys.argv[2],device="cpu",compute_type="int8"); '
               'segments,_=m.transcribe(sys.argv[1],**json.loads(sys.argv[3])); '
               'print(json.dumps([{"text":s.text.strip(),"no_speech_prob":getattr(s,"no_speech_prob",None),'
-              '"avg_logprob":getattr(s,"avg_logprob",None)} for s in segments if s.text.strip()],ensure_ascii=False))')
+              '"avg_logprob":getattr(s,"avg_logprob",None),"start":getattr(s,"start",None),"end":getattr(s,"end",None)} for s in segments if s.text.strip()],ensure_ascii=False))')
     try:
         env = dict(os.environ)
         env['HF_HOME'] = str(DATA / 'models')
@@ -327,6 +331,10 @@ def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
             else:
                 segments = []
                 texts = [str(item).strip() for item in result]
+            transcript_segments = [
+                {'start': segment.get('start'), 'end': segment.get('end'), 'text': str(segment.get('text') or '').strip()}
+                for segment in segments if str(segment.get('text') or '').strip()
+            ] if segments else []
             transcript = '\n'.join(text for text in texts if text)[:30000]
             low_confidence = False
             no_speech = [segment.get('no_speech_prob') for segment in segments if isinstance(segment.get('no_speech_prob'), (int, float))]
@@ -343,11 +351,11 @@ def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
                         audit.write('{} flagged transcript: {}\n'.format(utc_now(), transcript.replace('\n', '\\n')))
                 except OSError:
                     pass
-                return ''
-            return transcript
+                return '', []
+            return transcript, transcript_segments
     except (OSError, subprocess.SubprocessError, ValueError):
-        return ''
-    return ''
+        return '', []
+    return '', []
 
 
 def extract_video_assets(path, config, local_dir):
@@ -748,6 +756,14 @@ def persist_result(db, job, analysis, transcript, config):
     cleaned = text_value(analysis.get('cleaned_content'), 30000)
     transcript_cleaned = text_value(analysis.get('transcript_cleaned'), 30000)
     stt_corrected_text = text_value(analysis.get('stt_corrected_text'), 30000)
+    native_subtitle_text = text_value(analysis.get('native_subtitle_text'), 30000)
+    transcript_segments_raw = analysis.get('transcript_segments')
+    if isinstance(transcript_segments_raw, (list, dict)):
+        transcript_segments_json = json.dumps(transcript_segments_raw, ensure_ascii=False)[:50000]
+    elif isinstance(transcript_segments_raw, str):
+        transcript_segments_json = transcript_segments_raw[:50000]
+    else:
+        transcript_segments_json = ''
     ocr = str(analysis.get('ocr_text') or '')[:20000]
     language = text_value(analysis.get('language'), 40)
     location = analysis.get('location') if isinstance(analysis.get('location'), dict) else None
@@ -780,16 +796,17 @@ def persist_result(db, job, analysis, transcript, config):
     else:
         extracted_count = 0
     completeness_note = '선언 {}, 확인 {}'.format(declared, extracted_count) if declared and extracted_count < 0.7 * declared and declared - extracted_count >= 2 else ''
-    db.execute('''INSERT INTO analyses(job_id,content_type,title,category,summary,cleaned_content,structure_type,transcript,transcript_cleaned,stt_corrected_text,ocr_text,language,
+    db.execute('''INSERT INTO analyses(job_id,content_type,title,category,summary,cleaned_content,structure_type,transcript,transcript_cleaned,stt_corrected_text,ocr_text,language,native_subtitle_text,transcript_segments,
         location_name,location_address,confidence,model,status,error,completeness_note,analyzed_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
         content_type=excluded.content_type,title=excluded.title,category=excluded.category,summary=excluded.summary,
         cleaned_content=excluded.cleaned_content,structure_type=excluded.structure_type,transcript=excluded.transcript,transcript_cleaned=excluded.transcript_cleaned,
         stt_corrected_text=excluded.stt_corrected_text,
+        native_subtitle_text=excluded.native_subtitle_text,transcript_segments=excluded.transcript_segments,
         ocr_text=excluded.ocr_text,language=excluded.language,
         location_name=excluded.location_name,location_address=excluded.location_address,confidence=excluded.confidence,
         model=excluded.model,status=excluded.status,error='',completeness_note=excluded.completeness_note,analyzed_at=excluded.analyzed_at''',
-        (job['id'], content_type, title, category, summary, cleaned, structure_type, transcript[:30000], transcript_cleaned, stt_corrected_text, ocr, language,
+        (job['id'], content_type, title, category, summary, cleaned, structure_type, transcript[:30000], transcript_cleaned, stt_corrected_text, ocr, language, native_subtitle_text, transcript_segments_json,
          location_name, location_address, confidence, str(analysis.get('model') or '')[:120], result_status, '', completeness_note, analyzed_at))
     db.execute("UPDATE jobs SET status=?, analysis=?, tags=? WHERE id=?",
                (job_status, summary, json.dumps(clean_tags(analysis.get('tags')), ensure_ascii=False), job['id']))
@@ -946,9 +963,11 @@ def analyze_job(job, config):
     if not ai_available(config):
         return None, '설정된 AI 제공자를 사용할 수 없습니다. Hermes 상태 또는 API 설정을 확인해야 합니다.'
     transcript = str(job.get('subtitle_text') or '')[:30000]
+    native_subtitle_text = transcript
     frames = []
     image_paths = []
     audio_path = ''
+    speech_segments = []
     is_video_source = False
     temporary = tempfile.TemporaryDirectory(prefix='linkcollect-analysis-')
     media_path = job.get('media_path') or ''
@@ -960,7 +979,7 @@ def analyze_job(job, config):
             if not frames:
                 temporary.cleanup()
                 return None, '영상 프레임 추출에 실패했습니다. 원격 미디어 도구 상태와 영상 형식을 확인해야 합니다.'
-            speech = transcribe_audio(audio_path, config) if has_audio_stream and audio_path else ''
+            speech, speech_segments = transcribe_audio(audio_path, config) if has_audio_stream and audio_path else ('', [])
             transcript = '\n'.join(part for part in (transcript, speech) if part)[:30000]
         elif job.get('media_type', '').startswith('image') or full_path.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp', '.gif'):
             carousel_paths = job.get('carousel_media_paths') or []
@@ -1008,7 +1027,7 @@ def analyze_job(job, config):
             hint = '한국어 장소 목록 영상. 캡션과 화면에서 확인된 표현: ' + ' '.join((raw_text + ' ' + ocr).split())[:700]
             retry_texts = []
             for _ in range(2):
-                candidate = transcribe_audio(audio_path, config, retry=True, initial_prompt=hint)
+                candidate, _candidate_segments = transcribe_audio(audio_path, config, retry=True, initial_prompt=hint)
                 if candidate and candidate.strip() not in (transcript.strip(), *(x.strip() for x in retry_texts)):
                     retry_texts.append(candidate.strip())
             merged = '\n'.join(x for x in [transcript.strip(), *retry_texts] if x)[:30000]
@@ -1033,6 +1052,8 @@ def analyze_job(job, config):
         except Exception:
             result['transcript_cleaned'] = ''
         result['ocr_text'] = ocr
+        result['native_subtitle_text'] = native_subtitle_text
+        result['transcript_segments'] = speech_segments
         return result, ''
     finally:
         temporary.cleanup()
