@@ -99,6 +99,25 @@ def ensure_schema(db):
     CREATE INDEX IF NOT EXISTS idx_places_coordinates ON places(latitude, longitude);
     CREATE INDEX IF NOT EXISTS idx_analyses_status ON analyses(status);
     ''')
+    knowledge_columns = {row[1] for row in db.execute('PRAGMA table_info(knowledge_items)')}
+    if 'hidden' not in knowledge_columns:
+        db.execute("ALTER TABLE knowledge_items ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+    place_columns = {row[1] for row in db.execute('PRAGMA table_info(places)')}
+    for column in ('hidden', 'region_sido', 'region_sigungu'):
+        if column not in place_columns:
+            sql_type = "INTEGER NOT NULL DEFAULT 0" if column == 'hidden' else "TEXT NOT NULL DEFAULT ''"
+            db.execute(f"ALTER TABLE places ADD COLUMN {column} {sql_type}")
+    known_sido = {'서울', '서울특별시', '부산', '부산광역시', '대구', '대구광역시', '인천', '인천광역시',
+                  '광주', '광주광역시', '대전', '대전광역시', '울산', '울산광역시', '세종', '세종특별자치시',
+                  '경기', '경기도', '강원', '강원도', '강원특별자치도', '충북', '충청북도', '충남', '충청남도',
+                  '전북', '전라북도', '전북특별자치도', '전남', '전라남도', '경북', '경상북도', '경남',
+                  '경상남도', '제주', '제주특별자치도'}
+    for row in db.execute("SELECT id,address,region_sido,region_sigungu FROM places").fetchall():
+        parts = str(row['address'] or '').split()
+        sido = parts[0] if parts and parts[0] in known_sido else ''
+        sigungu = parts[1] if sido and len(parts) > 1 and re.search(r'(시|군|구)$', parts[1]) else ''
+        if (row['region_sido'], row['region_sigungu']) != (sido, sigungu):
+            db.execute("UPDATE places SET region_sido=?,region_sigungu=? WHERE id=?", (sido, sigungu, row['id']))
     analysis_columns = {row[1] for row in db.execute('PRAGMA table_info(analyses)')}
     if 'completeness_note' not in analysis_columns:
         db.execute("ALTER TABLE analyses ADD COLUMN completeness_note TEXT NOT NULL DEFAULT ''")
@@ -690,7 +709,7 @@ def download_public_post(job, config):
     return result, ''
 
 
-def naver_geocode(config, address, name=''):
+def naver_geocode(config, address, name='', include_regions=False):
     """Prefer an exact Naver Local Search match for place names, then try address geocoding."""
     region = re.sub(r'\s+', ' ', str(address or '')).strip()
     place_name = re.sub(r'\s+', ' ', str(name or '')).strip()
@@ -712,7 +731,8 @@ def naver_geocode(config, address, name=''):
                 item_address = ' '.join(str(item.get(k) or '') for k in ('address', 'roadAddress'))
                 if target and (target in title or title in target) and (not region or region in item_address):
                     if item.get('mapx') and item.get('mapy'):
-                        return float(item['mapy']) / 10000000, float(item['mapx']) / 10000000
+                        coords = (float(item['mapy']) / 10000000, float(item['mapx']) / 10000000)
+                        return (*coords, '', '') if include_regions else coords
         except Exception:
             pass
     key_id = env_value(config, 'LINKCOLLECT_NCP_MAP_API_KEY_ID')
@@ -734,7 +754,12 @@ def naver_geocode(config, address, name=''):
             with urllib.request.urlopen(req, timeout=12) as response:
                 addresses = json.loads(response.read().decode('utf-8')).get('addresses') or []
             if addresses:
-                return float(addresses[0]['y']), float(addresses[0]['x'])
+                first = addresses[0]
+                coords = (float(first['y']), float(first['x']))
+                if include_regions:
+                    regions = {kind: element.get('longName') or element.get('shortName') or '' for element in first.get('addressElements', []) for kind in element.get('types', [])}
+                    return (*coords, regions.get('SIDO', ''), regions.get('SIGUGUN', ''))
+                return coords
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 return None
@@ -877,7 +902,12 @@ def persist_result(db, job, analysis, transcript, config):
     if place_candidates:
         for place_name, place_address, place_category in place_candidates:
             address = place_address or place_name
-            coords = naver_geocode(config, address, place_name)
+            geocode = naver_geocode(config, address, place_name, include_regions=True)
+            coords = geocode[:2] if geocode else None
+            region_sido, region_sigungu = (geocode[2], geocode[3]) if geocode else ('', '')
+            if not region_sido:
+                address_parts = address.split()
+                region_sido, region_sigungu = (address_parts[0], address_parts[1]) if len(address_parts) > 1 else ('', '')
             digest = normalized_hash(place_name, place_address)
             naver_url = 'https://map.naver.com/p/search/' + urllib.parse.quote(address)
             existing = db.execute('SELECT id,latitude,longitude,geocode_status FROM places WHERE dedupe_hash=?', (digest,)).fetchone()
@@ -907,17 +937,17 @@ def persist_result(db, job, analysis, transcript, config):
             if existing:
                 place_id = existing['id']
                 if coords:
-                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,latitude=?,longitude=?,geocode_status='resolved',geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
-                               (place_name, place_address, digest, coords[0], coords[1], analyzed_at, naver_url, analyzed_at, place_id))
+                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,latitude=?,longitude=?,region_sido=?,region_sigungu=?,geocode_status='resolved',geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
+                               (place_name, place_address, digest, coords[0], coords[1], region_sido, region_sigungu, analyzed_at, naver_url, analyzed_at, place_id))
                 else:
                     status = 'resolved' if existing['latitude'] is not None and existing['longitude'] is not None else 'no_result'
                     db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,geocode_status=?,geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
                                (place_name, place_address, digest, status, analyzed_at, naver_url, analyzed_at, place_id))
             else:
                 place_id = uuid.uuid4().hex[:16]
-                db.execute('''INSERT INTO places(id,dedupe_hash,name,address,category,latitude,longitude,geocode_status,geocode_attempted_at,map_provider,naver_map_url,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''', (place_id, digest, place_name, place_address, place_category, coords[0] if coords else None,
-                    coords[1] if coords else None, 'resolved' if coords else 'no_result', analyzed_at, 'naver', naver_url, analyzed_at, analyzed_at))
+                db.execute('''INSERT INTO places(id,dedupe_hash,name,address,category,latitude,longitude,region_sido,region_sigungu,geocode_status,geocode_attempted_at,map_provider,naver_map_url,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (place_id, digest, place_name, place_address, place_category, coords[0] if coords else None,
+                    coords[1] if coords else None, region_sido, region_sigungu, 'resolved' if coords else 'no_result', analyzed_at, 'naver', naver_url, analyzed_at, analyzed_at))
             db.execute('INSERT OR IGNORE INTO place_sources(place_id,job_id) VALUES(?,?)', (place_id, job['id']))
     for tag in clean_tags(analysis.get('tags')):
         db.execute('INSERT OR IGNORE INTO tags(name) VALUES(?)', (tag,))
@@ -945,10 +975,15 @@ def resolve_pending_places(config):
             db.close()
             return False
         place_id, address = row['id'], row['address'] or row['name']
-        coords = naver_geocode(config, address, row["name"])
+        geocode = naver_geocode(config, address, row["name"], include_regions=True)
+        coords = geocode[:2] if geocode else None
+        region_sido, region_sigungu = (geocode[2], geocode[3]) if geocode else ('', '')
+        if not region_sido:
+            address_parts = address.split()
+            region_sido, region_sigungu = (address_parts[0], address_parts[1]) if len(address_parts) > 1 else ('', '')
         if coords:
-            db.execute("UPDATE places SET latitude=?,longitude=?,geocode_status='resolved',geocode_attempted_at=?,updated_at=? WHERE id=?",
-                       (coords[0], coords[1], utc_now(), utc_now(), place_id))
+            db.execute("UPDATE places SET latitude=?,longitude=?,region_sido=?,region_sigungu=?,geocode_status='resolved',geocode_attempted_at=?,updated_at=? WHERE id=?",
+                       (coords[0], coords[1], region_sido, region_sigungu, utc_now(), utc_now(), place_id))
         else:
             db.execute("UPDATE places SET geocode_status='no_result',geocode_attempted_at=?,updated_at=? WHERE id=?",
                        (utc_now(), utc_now(), place_id))

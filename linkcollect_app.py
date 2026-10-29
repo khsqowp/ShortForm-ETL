@@ -162,9 +162,9 @@ def linked_archive_sources(db, relation_table, relation_key, archive_id):
     return result
 
 
-def knowledge_list():
+def knowledge_list(include_hidden=False):
     with db_conn() as db:
-        rows = db.execute('''SELECT k.id,k.title,k.category,k.summary,k.content,k.language,k.created_at,k.tags AS raw_tags,
+        rows = db.execute('''SELECT k.id,k.title,k.category,k.summary,k.content,k.language,k.created_at,k.tags AS raw_tags,k.hidden,
             COUNT(s.job_id) AS source_count,
             (SELECT s2.job_id FROM knowledge_sources s2 JOIN jobs j2 ON j2.id=s2.job_id
              WHERE s2.knowledge_id=k.id AND j2.media_path!='' ORDER BY j2.created_at DESC LIMIT 1) AS thumbnail_job_id,
@@ -180,7 +180,7 @@ def knowledge_list():
             LEFT JOIN jobs dj ON dj.id=(SELECT s3.job_id FROM knowledge_sources s3 JOIN jobs j3 ON j3.id=s3.job_id
              WHERE s3.knowledge_id=k.id ORDER BY j3.created_at DESC LIMIT 1)
             LEFT JOIN analyses da ON da.job_id=dj.id
-            GROUP BY k.id ORDER BY k.updated_at DESC LIMIT 200''').fetchall()
+            WHERE (? OR k.hidden=0) GROUP BY k.id ORDER BY k.updated_at DESC LIMIT 200''', (int(include_hidden),)).fetchall()
         result = []
         for row in rows:
             item = dict(row)
@@ -196,14 +196,14 @@ def knowledge_list():
         return result
 
 
-def places_list():
+def places_list(include_hidden=False):
     with db_conn() as db:
         rows = db.execute('''SELECT p.id,p.name,p.address,p.category,p.latitude,p.longitude,p.naver_map_url,
-            p.geocode_status,p.created_at,COUNT(s.job_id) AS source_count,
+            p.geocode_status,p.region_sido,p.region_sigungu,p.hidden,p.created_at,COUNT(s.job_id) AS source_count,
             (SELECT s2.job_id FROM place_sources s2 JOIN jobs j2 ON j2.id=s2.job_id
              WHERE s2.place_id=p.id AND j2.media_path!='' ORDER BY j2.created_at DESC LIMIT 1) AS thumbnail_job_id
             FROM places p LEFT JOIN place_sources s ON s.place_id=p.id
-            GROUP BY p.id ORDER BY p.updated_at DESC LIMIT 200''').fetchall()
+            WHERE (? OR p.hidden=0) GROUP BY p.id ORDER BY p.updated_at DESC LIMIT 200''', (int(include_hidden),)).fetchall()
         result = []
         for row in rows:
             item = dict(row)
@@ -470,9 +470,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/jobs':
             return self.json(200, {'jobs': jobs_list()})
         if path == '/api/knowledge':
-            return self.json(200, {'items': knowledge_list()})
+            include_hidden = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('include_hidden') == ['1']
+            return self.json(200, {'items': knowledge_list(include_hidden)})
         if path == '/api/places':
-            return self.json(200, {'places': places_list()})
+            include_hidden = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('include_hidden') == ['1']
+            return self.json(200, {'places': places_list(include_hidden)})
         if path == '/health':
             return self.json(200, {'status': 'ok'})
         thumb_match = re.fullmatch(r'/api/jobs/([0-9a-f]{8,40})/thumbnail', path)
@@ -517,6 +519,26 @@ class Handler(BaseHTTPRequestHandler):
                            (address, dedupe_hash, naver_url, pipeline.utc_now(), place_id))
                 db.commit()
             return self.json(200, {'id': place_id, 'geocode_status': 'pending'})
+        if path == '/api/archive/visibility':
+            try:
+                payload = json.loads(self.rfile.read(length) or b'{}')
+            except Exception:
+                return self.json(400, {'error': 'JSON 형식을 확인하세요'})
+            if not isinstance(payload, dict):
+                return self.json(400, {'error': '요청 형식을 확인하세요'})
+            kind, item_id, hidden = payload.get('kind'), payload.get('id'), payload.get('hidden')
+            if kind not in ('knowledge', 'place') or not isinstance(hidden, bool):
+                return self.json(400, {'error': 'kind 또는 hidden 값이 올바르지 않습니다'})
+            if not isinstance(item_id, str) or not re.fullmatch(r'[0-9a-f]{16}', item_id):
+                return self.json(400, {'error': 'id는 16자리 소문자 16진수여야 합니다'})
+            table = 'knowledge_items' if kind == 'knowledge' else 'places'
+            with db_conn() as db:
+                pipeline.ensure_schema(db)
+                cursor = db.execute('UPDATE {} SET hidden=?,updated_at=? WHERE id=?'.format(table), (int(hidden), pipeline.utc_now(), item_id))
+                if cursor.rowcount == 0:
+                    return self.json(404, {'error': '항목을 찾을 수 없습니다'})
+                db.commit()
+            return self.json(200, {'id': item_id, 'kind': kind, 'hidden': hidden})
         if path == '/api/archive/reclassify':
             try:
                 payload = json.loads(self.rfile.read(length) or b'{}')
