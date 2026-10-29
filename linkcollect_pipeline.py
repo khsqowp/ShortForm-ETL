@@ -32,6 +32,22 @@ DATA = Path(os.environ.get('LINKCOLLECT_DATA_DIR', str(ROOT / 'data')))
 MEDIA = DATA / 'media'
 
 
+REGION_KNOWN_SIDO = frozenset({
+    '서울', '서울특별시', '부산', '부산광역시', '대구', '대구광역시', '인천', '인천광역시',
+    '광주', '광주광역시', '대전', '대전광역시', '울산', '울산광역시', '세종', '세종특별자치시',
+    '경기', '경기도', '강원', '강원도', '강원특별자치도', '충북', '충청북도', '충남', '충청남도',
+    '전북', '전라북도', '전북특별자치도', '전남', '전라남도', '경북', '경상북도', '경남',
+    '경상남도', '제주', '제주특별자치도'
+})
+
+
+def derive_region_tags(address):
+    parts = str(address or '').split()
+    sido = parts[0] if parts and parts[0] in REGION_KNOWN_SIDO else ''
+    sigungu = parts[1] if sido and len(parts) > 1 and re.search(r'(시|군|구)$', parts[1]) else ''
+    return sido, sigungu
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -107,15 +123,8 @@ def ensure_schema(db):
         if column not in place_columns:
             sql_type = "INTEGER NOT NULL DEFAULT 0" if column == 'hidden' else "TEXT NOT NULL DEFAULT ''"
             db.execute(f"ALTER TABLE places ADD COLUMN {column} {sql_type}")
-    known_sido = {'서울', '서울특별시', '부산', '부산광역시', '대구', '대구광역시', '인천', '인천광역시',
-                  '광주', '광주광역시', '대전', '대전광역시', '울산', '울산광역시', '세종', '세종특별자치시',
-                  '경기', '경기도', '강원', '강원도', '강원특별자치도', '충북', '충청북도', '충남', '충청남도',
-                  '전북', '전라북도', '전북특별자치도', '전남', '전라남도', '경북', '경상북도', '경남',
-                  '경상남도', '제주', '제주특별자치도'}
     for row in db.execute("SELECT id,address,region_sido,region_sigungu FROM places").fetchall():
-        parts = str(row['address'] or '').split()
-        sido = parts[0] if parts and parts[0] in known_sido else ''
-        sigungu = parts[1] if sido and len(parts) > 1 and re.search(r'(시|군|구)$', parts[1]) else ''
+        sido, sigungu = derive_region_tags(row['address'])
         if (row['region_sido'], row['region_sigungu']) != (sido, sigungu):
             db.execute("UPDATE places SET region_sido=?,region_sigungu=? WHERE id=?", (sido, sigungu, row['id']))
     analysis_columns = {row[1] for row in db.execute('PRAGMA table_info(analyses)')}
@@ -906,8 +915,7 @@ def persist_result(db, job, analysis, transcript, config):
             coords = geocode[:2] if geocode else None
             region_sido, region_sigungu = (geocode[2], geocode[3]) if geocode else ('', '')
             if not region_sido:
-                address_parts = address.split()
-                region_sido, region_sigungu = (address_parts[0], address_parts[1]) if len(address_parts) > 1 else ('', '')
+                region_sido, region_sigungu = derive_region_tags(address)
             digest = normalized_hash(place_name, place_address)
             naver_url = 'https://map.naver.com/p/search/' + urllib.parse.quote(address)
             existing = db.execute('SELECT id,latitude,longitude,geocode_status FROM places WHERE dedupe_hash=?', (digest,)).fetchone()
@@ -979,8 +987,7 @@ def resolve_pending_places(config):
         coords = geocode[:2] if geocode else None
         region_sido, region_sigungu = (geocode[2], geocode[3]) if geocode else ('', '')
         if not region_sido:
-            address_parts = address.split()
-            region_sido, region_sigungu = (address_parts[0], address_parts[1]) if len(address_parts) > 1 else ('', '')
+            region_sido, region_sigungu = derive_region_tags(address)
         if coords:
             db.execute("UPDATE places SET latitude=?,longitude=?,region_sido=?,region_sigungu=?,geocode_status='resolved',geocode_attempted_at=?,updated_at=? WHERE id=?",
                        (coords[0], coords[1], region_sido, region_sigungu, utc_now(), utc_now(), place_id))
