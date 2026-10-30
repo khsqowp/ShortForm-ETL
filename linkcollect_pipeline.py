@@ -547,9 +547,10 @@ def request_analysis(config, text, image_paths, video_frames, transcript, ocr=''
                  '나열형/비교형 콘텐츠는 절대 뭉뚱그려 요약하지 말고 모든 항목을 누락 없이 cleaned_content에 마크다운 표 또는 번호 목록으로 보존한다. '
                  '이 경우 summary는 "표/목록 N개 항목 정리됨" 형태의 짧은 메타 정보로 쓴다. '
                  '반면 single_topic(단일 주제 서술형) 콘텐츠는 압축 요약이 아니라 재구성이다: cleaned_content는 캡션·OCR·전사가 담은 세부 설명과 정보량을 최대한 보존하면서 원본 분량(글자 수) 대비 대략 80% 수준을 유지하도록 문장과 문단만 읽기 쉽게 다듬어 재구성한다. 한두 문장으로 축약하거나 핵심 키워드만 나열하지 않는다. summary는 전체 내용을 미리 보기 위한 1~2문장짜리 짧은 소개로만 쓰고, 세부 정보는 summary가 아니라 cleaned_content에 담는다. '
-                 '여러 식당/장소가 있으면 content_type은 place 또는 mixed, places는 [{{name,address_or_region,description}},...]로 모두 출력한다. '
+                 '여러 식당/장소가 있으면 content_type은 place 또는 mixed, places는 [{{name,address_or_region,description,category}},...]로 모두 출력한다. '
                  '캡션에서 장소 목록임이 명확하면 화면 OCR에서 명확히 읽힌 상호와 캡션에 직접 나온 상호를 빠짐없이 별도 항목으로 포함하고 중복만 제거한다. OCR은 실제 화면 텍스트로 구분해 활용하되, OCR에 없는 상호·주소·설명은 추정하지 않는다. 메뉴명·상품명·주류 브랜드는 실제 방문 장소로 확인되지 않으면 장소로 만들지 말고, 깨진 OCR 명칭은 추측해 복원하지 않는다. 주소가 불명확하면 확인된 지역만 쓰며 지어내지 않는다. '
                  '단일 장소는 location 객체(name,address,category)를 사용한다. '
+                 'location.category와 각 places 항목의 category는 24시간카페, 디저트카페, 작업카페, 뷰카페, 노원구맛집처럼 해시태그다운 짧고 구체적인 복합명사로 공백 없이 간결하게 쓰고, "홍대 24시간 카페 추천" 같은 긴 표현은 추천·소개·베스트 등 군더더기를 버리고 핵심 주제인 "24시간카페"로 압축하며 "OO구 맛집"·"OO동 맛집"은 "OO구맛집"·"OO동맛집"으로 정규화한다. 캡션·OCR·전사에 뒷받침되는 주제 표현이 없으면 대표 메뉴(예: 크로플, 수제버거)를 쓰고 주제를 지어내거나 장소·카페·맛집만 단독으로 쓰지 않는다. '
                  'JSON 필드: structure_type, title, content_type(information|place|mixed|other), category(development|security|investment|fashion_beauty|other), '
                  'summary, cleaned_content, tags(문자열 배열 최대 12개), language, confidence(0~1), places(장소 배열, 없으면 []), '
                  'location(객체 또는 null; name,address,category). 입력 캡션:\n{}\n\n화면 OCR:\n{}\n\n음성 전사:\n{}').format(text[:16000], ocr[:20000], transcript[:20000])}]
@@ -896,11 +897,11 @@ def persist_result(db, job, analysis, transcript, config):
                 continue
             name = text_value(item.get('name'), 300).strip()
             if name:
-                place_candidates.append((name, text_value(item.get('address_or_region'), 500).strip(), 'place'))
+                place_candidates.append((name, text_value(item.get('address_or_region'), 500).strip(), text_value(item.get('category'), 50).strip()))
         if not place_candidates and location_name:
-            place_candidates.append((location_name, location_address, str((location or {}).get('category') or 'place')[:50]))
+            place_candidates.append((location_name, location_address, str((location or {}).get('category') or '')[:50].strip()))
     elif location_name and content_type in ('place', 'mixed'):
-        place_candidates.append((location_name, location_address, str((location or {}).get('category') or 'place')[:50]))
+        place_candidates.append((location_name, location_address, str((location or {}).get('category') or '')[:50].strip()))
     if structure_type == 'place_list':
         summary = '장소 목록 {}곳 정리됨'.format(len(place_candidates))
         analysis['summary'] = summary
