@@ -92,6 +92,8 @@ def ensure_schema(db):
     CREATE TABLE IF NOT EXISTS places (
       id TEXT PRIMARY KEY, dedupe_hash TEXT NOT NULL UNIQUE,
       name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '',
+      -- Legacy default: current persist_result INSERT and UPDATE paths pass category explicitly,
+      -- including '' when no usable AI topic exists; retained to avoid a risky SQLite rebuild.
       category TEXT NOT NULL DEFAULT 'place', latitude REAL, longitude REAL,
       geocode_status TEXT NOT NULL DEFAULT 'pending', geocode_attempted_at TEXT NOT NULL DEFAULT '',
       map_provider TEXT NOT NULL DEFAULT 'naver', naver_map_url TEXT NOT NULL DEFAULT '',
@@ -919,7 +921,7 @@ def persist_result(db, job, analysis, transcript, config):
                 region_sido, region_sigungu = derive_region_tags(address)
             digest = normalized_hash(place_name, place_address)
             naver_url = 'https://map.naver.com/p/search/' + urllib.parse.quote(address)
-            existing = db.execute('SELECT id,latitude,longitude,geocode_status FROM places WHERE dedupe_hash=?', (digest,)).fetchone()
+            existing = db.execute('SELECT id,category,latitude,longitude,geocode_status FROM places WHERE dedupe_hash=?', (digest,)).fetchone()
             if not existing:
                 # Exact-hash lookup misses when the AI rephrases a vague region string between
                 # re-analyses of the same venue (e.g. "잠실" vs "잠실·송파"). Fall back to a
@@ -928,11 +930,11 @@ def persist_result(db, job, analysis, transcript, config):
                 name_key = place_name_key(place_name)
                 addr_tokens = place_address_tokens(place_address)
                 for previous_id in previous_place_ids:
-                    candidate = db.execute('SELECT id,name,address,latitude,longitude,geocode_status FROM places WHERE id=?', (previous_id,)).fetchone()
+                    candidate = db.execute('SELECT id,name,address,category,latitude,longitude,geocode_status FROM places WHERE id=?', (previous_id,)).fetchone()
                     if candidate and place_name_key(candidate['name']) == name_key:
                         existing = candidate
                         break
-                for candidate in (() if existing else db.execute('SELECT id,name,address,latitude,longitude,geocode_status FROM places').fetchall()):
+                for candidate in (() if existing else db.execute('SELECT id,name,address,category,latitude,longitude,geocode_status FROM places').fetchall()):
                     if place_name_key(candidate['name']) != name_key:
                         continue
                     candidate_tokens = place_address_tokens(candidate['address'])
@@ -945,13 +947,14 @@ def persist_result(db, job, analysis, transcript, config):
                         break
             if existing:
                 place_id = existing['id']
+                new_category = place_category if place_category else existing['category']
                 if coords:
-                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,latitude=?,longitude=?,region_sido=?,region_sigungu=?,geocode_status='resolved',geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
-                               (place_name, place_address, digest, coords[0], coords[1], region_sido, region_sigungu, analyzed_at, naver_url, analyzed_at, place_id))
+                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,category=?,latitude=?,longitude=?,region_sido=?,region_sigungu=?,geocode_status='resolved',geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
+                               (place_name, place_address, digest, new_category, coords[0], coords[1], region_sido, region_sigungu, analyzed_at, naver_url, analyzed_at, place_id))
                 else:
                     status = 'resolved' if existing['latitude'] is not None and existing['longitude'] is not None else 'no_result'
-                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,geocode_status=?,geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
-                               (place_name, place_address, digest, status, analyzed_at, naver_url, analyzed_at, place_id))
+                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,category=?,geocode_status=?,geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
+                               (place_name, place_address, digest, new_category, status, analyzed_at, naver_url, analyzed_at, place_id))
             else:
                 place_id = uuid.uuid4().hex[:16]
                 db.execute('''INSERT INTO places(id,dedupe_hash,name,address,category,latitude,longitude,region_sido,region_sigungu,geocode_status,geocode_attempted_at,map_provider,naver_map_url,created_at,updated_at)
