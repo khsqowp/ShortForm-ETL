@@ -13,6 +13,10 @@ Usage:
   python3 backfill_place_categories.py --dry-run   # no DB writes, writes report only
   python3 backfill_place_categories.py --apply     # performs the UPDATE places SET category=...
 
+By default, rows whose category is already non-empty and not the stale placeholder
+'place' are reported as skipped_already_set and are not sent to the AI or updated.
+Pass --force with either mode to process all rows, including already-set categories.
+
 Never overwrites a row with an empty/unusable AI result; never touches any column
 other than places.category.
 """
@@ -33,7 +37,7 @@ import linkcollect_pipeline as pipeline  # noqa: E402
 import linkcollect_app as app  # noqa: E402
 
 DB_PATH = REPO / 'data' / 'linkcollect.sqlite3'
-SCRATCH = Path(__file__).resolve().parent
+SCRATCH = Path('/home/opc/My_Archive/backfill_scratch')
 REPORT_JSON = SCRATCH / 'backfill_report.json'
 REPORT_TABLE = SCRATCH / 'backfill_report.tsv'
 
@@ -128,6 +132,8 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--dry-run', action='store_true')
     mode.add_argument('--apply', action='store_true')
+    parser.add_argument('--force', action='store_true', default=False,
+                        help='process all rows, including rows with an existing category')
     parser.add_argument('--sleep', type=float, default=1.5, help='seconds between AI calls')
     args = parser.parse_args()
 
@@ -140,6 +146,9 @@ def main():
     db.row_factory = sqlite3.Row
 
     places = db.execute('SELECT id,name,address,category,dedupe_hash FROM places ORDER BY created_at').fetchall()
+    stale_categories = {'', 'place'}
+    work = [p for p in places if args.force or p['category'] in stale_categories]
+    already_set = [p for p in places if not args.force and p['category'] not in stale_categories]
     job_for_place = {}
     place_for_job = {}
     for row in db.execute('SELECT place_id, job_id FROM place_sources'):
@@ -147,7 +156,8 @@ def main():
         place_for_job.setdefault(row['job_id'], []).append(row['place_id'])
     place_by_id = {p['id']: p for p in places}
 
-    needed_jobs = sorted({jid for ids in job_for_place.values() for jid in ids})
+    work_place_ids = {p['id'] for p in work}
+    needed_jobs = sorted({jid for pid in work_place_ids for jid in job_for_place.get(pid, [])})
     print('{} places, {} unique source jobs to query'.format(len(places), len(needed_jobs)))
 
     # per-job: list of (candidates, attempt_no) accumulated across bounded retry attempts.
@@ -163,7 +173,7 @@ def main():
     for i, jid in enumerate(needed_jobs, 1):
         job = db.execute('SELECT id,source_title,extracted_caption,text,url FROM jobs WHERE id=?', (jid,)).fetchone()
         arow = db.execute('SELECT ocr_text,transcript FROM analyses WHERE job_id=?', (jid,)).fetchone()
-        target_pids = place_for_job.get(jid, [])
+        target_pids = [pid for pid in place_for_job.get(jid, []) if pid in work_place_ids]
         if not job:
             job_attempts_used[jid] = (0, 'job row missing')
             continue
@@ -205,7 +215,16 @@ def main():
         job_attempts_used[jid] = (attempt, last_err)
 
     results = []
+    for place in already_set:
+        results.append({
+            'place_id': place['id'], 'name': place['name'], 'address': place['address'],
+            'old_category': place['category'], 'new_category': place['category'],
+            'used_job': '', 'source_jobs': job_for_place.get(place['id'], []),
+            'action': 'skipped_already_set', 'note': 'existing non-stale category preserved; AI query skipped',
+        })
     for place in places:
+        if place['id'] not in work_place_ids:
+            continue
         pid, name, address, old_category = place['id'], place['name'], place['address'], place['category']
         jids = job_for_place.get(pid, [])
         found = job_match_source.get(pid)
@@ -239,13 +258,16 @@ def main():
     changed = [r for r in results if r['action'] == 'changed']
     unchanged_same = [r for r in results if r['action'] == 'unchanged_same_value']
     fallback = [r for r in results if r['action'] == 'fallback_kept_existing']
+    skipped_already_set = [r for r in results if r['action'] == 'skipped_already_set']
 
     print('\n=== SUMMARY ===')
     print('total places:', len(results))
     print('changed:', len(changed))
     print('unchanged (AI returned same value):', len(unchanged_same))
     print('fallback (no usable AI category, kept old value):', len(fallback))
+    print('skipped_already_set:', len(skipped_already_set))
 
+    SCRATCH.mkdir(parents=True, exist_ok=True)
     REPORT_JSON.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
     with open(REPORT_TABLE, 'w', encoding='utf-8') as fh:
         fh.write('place_id\tname\taddress\told_category\tnew_category\taction\tused_job\tnote\n')
@@ -259,8 +281,8 @@ def main():
     if args.apply:
         applied = 0
         for r in changed:
-            # Re-check current DB value right before writing (non-destructive rule: never
-            # clobber if something else already updated it to a non-stale value meanwhile).
+            # Re-check that the row still exists before writing; this does not check whether
+            # its category changed since the initial SELECT.
             cur = db.execute('SELECT category FROM places WHERE id=?', (r['place_id'],)).fetchone()
             if cur is None:
                 continue
