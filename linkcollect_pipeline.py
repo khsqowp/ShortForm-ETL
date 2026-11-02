@@ -632,12 +632,16 @@ SUPPORTED_HOSTS = {
 }
 
 
+def hostname_matches(host, base):
+    return host == base or host.endswith('.' + base)
+
+
 def supported_public_url(url):
     try:
         parsed = urllib.parse.urlsplit(url)
         host = (parsed.hostname or '').lower().rstrip('.')
         return parsed.scheme == 'https' and parsed.username is None and parsed.password is None and \
-            parsed.port in (None, 443) and any(host == base or host.endswith('.' + base) for base in SUPPORTED_HOSTS)
+            parsed.port in (None, 443) and any(hostname_matches(host, base) for base in SUPPORTED_HOSTS)
     except ValueError:
         return False
 
@@ -684,7 +688,26 @@ def download_public_post(job, config):
         return None, '공개 원문 다운로드가 시간 초과 또는 실행 오류로 끝났습니다.'
     files = [Path(item) for item in glob.glob(str(dest_dir / '*')) if Path(item).is_file()]
     if not files:
-        return None, '사이트에서 공개 미디어를 제공하지 않았거나 로그인이 필요합니다. 접근 제한은 우회하지 않습니다.'
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            host = (parsed.hostname or '').lower().rstrip('.')
+        except ValueError:
+            host = ''
+        is_x_host = any(hostname_matches(host, base) for base in ('x.com', 'twitter.com'))
+        if is_x_host:
+            gallerydl = env_value(config, 'LINKCOLLECT_GALLERYDL_BIN',
+                '/home/opc/My_Archive/TELEGRAM_KHSQOWP_LinkCollectbot/tools/gallery-dl-venv/bin/gallery-dl')
+            if not Path(gallerydl).is_file():
+                gallerydl = shutil.which('gallery-dl') or ''
+            if gallerydl:
+                try:
+                    subprocess.run([gallerydl, '--config-ignore', '--directory', str(dest_dir), url],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600, check=False)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                files = [Path(item) for item in glob.glob(str(dest_dir / '*')) if Path(item).is_file()]
+        if not files:
+            return None, '사이트에서 공개 미디어를 제공하지 않았거나 로그인이 필요합니다. 접근 제한은 우회하지 않습니다.'
     info_files = [p for p in files if p.name.endswith('.info.json')]
     info = {}
     if info_files:
