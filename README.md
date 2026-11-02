@@ -66,6 +66,7 @@
 | `LINKCOLLECT_AI_API_KEY` | OpenAI 호환 API 키 | `openai` 제공자일 때 필수 |
 | `LINKCOLLECT_AI_BASE_URL` | OpenAI 호환 API Base URL | 선택 (기본: `https://api.openai.com/v1`, `openai` 제공자일 때만 사용) |
 | `LINKCOLLECT_YTDLP_BIN` | 공개 게시물 다운로드용 `yt-dlp` 실행 파일 경로 | 선택 (기본 경로에 없으면 `PATH`의 `yt-dlp` 사용) |
+| `LINKCOLLECT_GALLERYDL_BIN` | `yt-dlp`가 파일을 반환하지 않은 X/Twitter 이미지 전용 게시물의 대체 수집용 `gallery-dl` 실행 파일 경로 | 선택 (기본 경로: `tools/gallery-dl-venv/bin/gallery-dl`, 없으면 `PATH`의 `gallery-dl` 사용) |
 | `LINKCOLLECT_WHISPER_PYTHON` | `faster-whisper`가 설치된 Python 인터프리터 경로 | 선택 (기본값 있음) |
 | `LINKCOLLECT_WHISPER_MODEL` | `faster-whisper` 모델명 | 선택 (기본: `small`) |
 | `LINKCOLLECT_NCP_MAP_API_KEY_ID` | 네이버 클라우드 플랫폼 Geocoding API Key ID | 선택 (없으면 장소 좌표 변환 생략) |
