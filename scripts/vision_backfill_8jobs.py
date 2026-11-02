@@ -268,13 +268,16 @@ def main():
     if args.apply:
         applied = 0
         for r in changed:
-            cur = db.execute('SELECT category FROM places WHERE id=?', (r['place_id'],)).fetchone()
-            if cur is None:
-                continue
-            db.execute('UPDATE places SET category=?,updated_at=? WHERE id=?',
-                       (r['new_category'], utc_now(), r['place_id']))
+            # Compare-and-set protects a category changed by the live service while
+            # this one-off AI pass was running. Only overwrite the stale value that
+            # was read when the run started; never replace a newly resolved category.
+            cur = db.execute(
+                'UPDATE places SET category=?,updated_at=? '
+                'WHERE id=? AND category=? AND category IN (?,?)',
+                (r['new_category'], utc_now(), r['place_id'], r['old_category'], '', 'place'),
+            )
             db.commit()
-            applied += 1
+            applied += cur.rowcount
         print('Applied {} category updates.'.format(applied))
         integrity = db.execute('PRAGMA integrity_check').fetchone()[0]
         count_after = db.execute('SELECT count(*) FROM places').fetchone()[0]
