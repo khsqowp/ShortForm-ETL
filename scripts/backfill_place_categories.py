@@ -16,6 +16,10 @@ Usage:
 By default, rows whose category is already non-empty and not the stale placeholder
 'place' are reported as skipped_already_set and are not sent to the AI or updated.
 Pass --force with either mode to process all rows, including already-set categories.
+(Rows still contribute their already-known name/category as matching context for
+other places sharing the same source job even when skipped -- see match_candidate()
+and the elimination pass in main() -- so turning this off does not reduce matching
+accuracy for the rows that *are* being processed.)
 
 Never overwrites a row with an empty/unusable AI result; never touches any column
 other than places.category.
@@ -40,6 +44,27 @@ DB_PATH = REPO / 'data' / 'linkcollect.sqlite3'
 SCRATCH = Path('/home/opc/My_Archive/backfill_scratch')
 REPORT_JSON = SCRATCH / 'backfill_report.json'
 REPORT_TABLE = SCRATCH / 'backfill_report.tsv'
+
+# Top-level 시/도 names: too coarse to disambiguate between two different real
+# venues that happen to share a literal name (nearly every Seoul address
+# contains "서울"), so they are excluded when checking whether a candidate's
+# address plausibly agrees with a DB place's stored address (see match_candidate).
+_REGION_STOPWORDS = {
+    '서울', '서울시', '서울특별시',
+    '부산', '부산시', '부산광역시',
+    '대구', '대구시', '대구광역시',
+    '인천', '인천시', '인천광역시',
+    '광주', '광주시', '광주광역시',
+    '대전', '대전시', '대전광역시',
+    '울산', '울산시', '울산광역시',
+    '세종', '세종시', '세종특별자치시',
+    '경기', '경기도',
+    '강원', '강원도', '강원특별자치도',
+    '충북', '충청북도', '충남', '충청남도',
+    '전북', '전북특별자치도', '전라북도', '전남', '전라남도',
+    '경북', '경상북도', '경남', '경상남도',
+    '제주', '제주도', '제주특별자치도',
+}
 
 
 def utc_now():
@@ -86,9 +111,16 @@ def extract_place_candidates(analysis):
     return candidates
 
 
+def significant_address_tokens(tokens):
+    """Drop top-level region tokens that are too coarse to disambiguate same-named
+    venues in different neighborhoods (see _REGION_STOPWORDS)."""
+    return {t for t in tokens if t not in _REGION_STOPWORDS}
+
+
 def match_candidate(place_name, place_address, candidates):
     name_key = pipeline.place_name_key(place_name)
     addr_tokens = pipeline.place_address_tokens(place_address)
+    sig_place = significant_address_tokens(addr_tokens)
     exact = []
     for cand_name, cand_addr, cand_cat in candidates:
         if pipeline.place_name_key(cand_name) == name_key:
@@ -96,6 +128,16 @@ def match_candidate(place_name, place_address, candidates):
     if not exact:
         return None
     if len(exact) == 1:
+        cand_name, cand_addr, cand_cat = exact[0]
+        sig_cand = significant_address_tokens(pipeline.place_address_tokens(cand_addr))
+        # Name matches exactly, but if both sides have neighborhood-level address
+        # info and it flatly disagrees (e.g. the AI attached the wrong dong/gu to
+        # this literal name this round, or two different real venues happen to
+        # share the name), do not blindly accept -- a wrong confident match is
+        # worse than a fallback. Only the coarse 시/도 token is excluded above, so
+        # this does not fire just because two Seoul places both say "서울".
+        if sig_place and sig_cand and not (sig_place & sig_cand):
+            return None
         return exact[0]
     # Disambiguate same-name multi-branch candidates by address token overlap.
     for cand_name, cand_addr, cand_cat in exact:
@@ -166,14 +208,27 @@ def main():
     # attempts, so every assigned category is traceable to one real AI response -- the
     # retries exist only to counter pure sampling variance on large place_list jobs
     # dropping/renaming some entries, not to broaden matching leniency.
-    MAX_ATTEMPTS = 3
+    #
+    # MAX_ATTEMPTS raised from 3 to 6: large place_list jobs (20+ venues) showed high
+    # per-call name-rendering variance (the same venue gets a slightly different name
+    # or abbreviation on different calls), so a place that fails to render its exact
+    # stored name on attempts 1-3 often does on a later attempt; this costs nothing
+    # extra since the AI call is a local hermes container, not a paid API.
+    MAX_ATTEMPTS = 6
     job_attempts_used = {}
-    job_match_source = {}  # place_id -> (jid, attempt_no, candidate_name)
+    job_match_source = {}  # place_id -> (jid, attempt_no, candidate_name, candidate_category)
 
     for i, jid in enumerate(needed_jobs, 1):
         job = db.execute('SELECT id,source_title,extracted_caption,text,url FROM jobs WHERE id=?', (jid,)).fetchone()
         arow = db.execute('SELECT ocr_text,transcript FROM analyses WHERE job_id=?', (jid,)).fetchone()
-        target_pids = [pid for pid in place_for_job.get(jid, []) if pid in work_place_ids]
+        # target_pids_full includes every place sourced by this job, even rows this
+        # run isn't allowed to update (skipped_already_set) -- they're still needed
+        # as matching context below so an already-known venue's exact-name match
+        # correctly "claims" its candidate instead of it being mistaken for a
+        # leftover candidate belonging to one of the rows we're actually trying to
+        # resolve. target_pids restricts what we actually track/assign to work rows.
+        target_pids_full = place_for_job.get(jid, [])
+        target_pids = [pid for pid in target_pids_full if pid in work_place_ids]
         if not job:
             job_attempts_used[jid] = (0, 'job row missing')
             continue
@@ -198,16 +253,44 @@ def main():
                 time.sleep(args.sleep)
                 continue
             candidates = extract_place_candidates(analysis)
-            for pid in list(unmatched):
+
+            # Pass 1: address-validated exact name matches, computed against every
+            # place sourced from this job (target_pids_full, not just the rows we're
+            # allowed to update) so we know which candidates this response already
+            # accounts for.
+            exact_match_for_pid = {}
+            for pid in target_pids_full:
+                if pid in job_match_source:
+                    continue
                 place = place_by_id[pid]
                 match = match_candidate(place['name'], place['address'], candidates)
-                if not match and len(target_pids) == 1 and len(candidates) == 1:
-                    # Zero-ambiguity shortcut: this job sources exactly one place in our
-                    # DB and the AI returned exactly one candidate for it in this same
-                    # response, so a formatting-only name mismatch (e.g. parenthetical
-                    # alt-name dropped between runs) cannot misattribute to a different
-                    # venue -- there is no other candidate or target it could be.
-                    match = candidates[0]
+                if match:
+                    exact_match_for_pid[pid] = match
+
+            claimed_keys = {pipeline.place_name_key(m[0]) for m in exact_match_for_pid.values()}
+            claimed_keys |= {
+                pipeline.place_name_key(place_by_id[pid]['name'])
+                for pid in target_pids_full if pid in job_match_source
+            }
+            leftover_targets = [
+                pid for pid in target_pids
+                if pid not in exact_match_for_pid and pid not in job_match_source
+            ]
+            leftover_candidates = [c for c in candidates if pipeline.place_name_key(c[0]) not in claimed_keys]
+
+            if len(leftover_targets) == 1 and len(leftover_candidates) == 1 and leftover_candidates[0][2]:
+                # Zero-ambiguity shortcut, generalized: every OTHER place sourced
+                # from this job was already accounted for (by an address-validated
+                # exact name match, this attempt or an earlier one), and every
+                # OTHER candidate in this same response was claimed by one of those
+                # matches. Exactly one target and exactly one candidate are left
+                # over, so -- with no other candidate or target it could possibly
+                # be -- this is a formatting-only name mismatch (e.g. a branch
+                # suffix or a leading generic word dropped/added), not ambiguity.
+                exact_match_for_pid[leftover_targets[0]] = leftover_candidates[0]
+
+            for pid in list(unmatched):
+                match = exact_match_for_pid.get(pid)
                 if match and match[2]:
                     job_match_source[pid] = (jid, attempt, match[0], match[2])
                     unmatched.discard(pid)
