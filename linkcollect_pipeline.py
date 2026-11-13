@@ -22,6 +22,8 @@ import urllib.request
 import uuid
 from place_groups import classify_group
 from place_keywords import validate_keywords
+from error_classifier import classify_error
+from faithfulness_guard import assess_faithfulness
 import glob
 import unicodedata
 from difflib import SequenceMatcher
@@ -184,6 +186,33 @@ def env_value(config, key, default=''):
     return str(config.get(key, default) or '').strip()
 
 
+def _stt_debug(reason, job_id='', length_ratio=''):
+    """Write metadata only; transcript text must never enter the STT log."""
+    try:
+        log_dir = DATA / 'logs'
+        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        with open(log_dir / 'stt_debug.log', 'a', encoding='utf-8') as audit:
+            audit.write('{} job={} reason={} length_ratio={}\n'.format(
+                utc_now(), re.sub(r'[^a-zA-Z0-9_-]', '', str(job_id))[:64],
+                re.sub(r'[^a-zA-Z0-9,_-]', '', str(reason))[:160], length_ratio))
+    except OSError:
+        pass
+
+
+def _safe_download_detail(stderr):
+    text = str(stderr or '')
+    text = re.sub(r'https?://[^\s]+', '[URL]', text, flags=re.I)
+    text = re.sub(r'(?i)\b(cookie|authorization|token|api[_-]?key|sessionid)\b\s*[:=]\s*[^\s,;]+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)(--cookies?\s+)[^\s]+', r'\1[REDACTED]', text)
+    return re.sub(r'\s+', ' ', text).strip()[:400]
+
+
+def _download_error(message, error_text='', returncode=None):
+    detail = _safe_download_detail(error_text)
+    raw = '{}{}'.format(detail, ' rc={}'.format(returncode) if returncode is not None else '')
+    return '[{}] {} | raw: {}'.format(classify_error(error_text), message, raw[:400] or 'no downloader detail')
+
+
 HERMES_HTTP_BRIDGE = r'''import json, os, sys, urllib.request
 home = os.environ.get("HERMES_HOME", "/opt/data")
 values = {}
@@ -261,7 +290,7 @@ def clean_transcript(config, transcript, source_context=''):
     return '\n'.join(lines)[:30000]
 
 
-def correct_transcript_typos(config, transcript, source_context=''):
+def correct_transcript_typos(config, transcript, source_context='', job_id=''):
     """Ask the configured AI model to fix obvious STT misrecognition typos only.
     Same length and wording as the input; this is a correction pass, not a summary."""
     transcript = str(transcript or '').strip()
@@ -292,7 +321,15 @@ def correct_transcript_typos(config, transcript, source_context=''):
         raw = raw.strip()
         if raw.startswith('```'):
             raw = re.sub(r'^```(?:\w+)?\s*|\s*```$', '', raw, flags=re.I)
-        return raw[:30000]
+        raw = raw[:30000]
+        assessment = assess_faithfulness(transcript, raw)
+        ratio = '{:.3f}'.format(assessment['length_ratio'])
+        if assessment['reasons']:
+            _stt_debug(','.join(assessment['reasons']), job_id, ratio)
+            return transcript[:30000]
+        if assessment['flags']:
+            _stt_debug('soft:' + ','.join(assessment['flags']), job_id, ratio)
+        return raw
     except Exception:
         return ''
 
@@ -345,10 +382,12 @@ def is_offtopic_transcript(transcript, reference_text):
 
 def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
     if not audio_path:
+        _stt_debug('missing-audio-path')
         return '', []
     whisper_python = env_value(config, 'LINKCOLLECT_WHISPER_PYTHON',
         '/home/opc/My_Archive/TELEGRAM_KHSQOWP_LinkCollectbot/tools/yt-dlp-venv/bin/python')
     model = env_value(config, 'LINKCOLLECT_WHISPER_MODEL', 'small')
+    download_root = env_value(config, 'LINKCOLLECT_WHISPER_CACHE')
     options = {'beam_size': 5, 'vad_filter': True, 'initial_prompt': initial_prompt[:800]} if retry else {'beam_size': 5, 'vad_filter': True}
     script = ('import json,sys,os; from faster_whisper import WhisperModel; '
               'm=WhisperModel(sys.argv[2],device="cpu",compute_type="int8"); '
@@ -359,7 +398,10 @@ def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
         env = dict(os.environ)
         env['HF_HOME'] = str(DATA / 'models')
         os.makedirs(env['HF_HOME'], mode=0o700, exist_ok=True)
-        proc = subprocess.run([whisper_python, '-c', script, audio_path, model, json.dumps(options, ensure_ascii=False)],
+        script = script.replace('m=WhisperModel(sys.argv[2],device="cpu",compute_type="int8");',
+            'm=WhisperModel(sys.argv[2],device="cpu",compute_type="int8",download_root=(sys.argv[4] or None));')
+        argv = [whisper_python, '-c', script, audio_path, model, json.dumps(options, ensure_ascii=False), download_root]
+        proc = subprocess.run(argv,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=900, check=False, env=env)
         if proc.returncode == 0:
             result = json.loads(proc.stdout.decode('utf-8'))
@@ -382,16 +424,15 @@ def transcribe_audio(audio_path, config, retry=False, initial_prompt=""):
             if avg_logprob and sum(value < -1.0 for value in avg_logprob) / len(avg_logprob) > 0.5:
                 low_confidence = True
             if transcript and (low_confidence or is_degenerate_transcript(transcript)):
-                try:
-                    log_dir = DATA / 'logs'
-                    os.makedirs(log_dir, mode=0o700, exist_ok=True)
-                    with open(log_dir / 'stt_debug.log', 'a', encoding='utf-8') as audit:
-                        audit.write('{} flagged transcript: {}\n'.format(utc_now(), transcript.replace('\n', '\\n')))
-                except OSError:
-                    pass
+                _stt_debug('filtered-low-confidence' if low_confidence else 'filtered-degenerate')
                 return '', []
+            if not transcript:
+                _stt_debug('empty-output')
             return transcript, transcript_segments
-    except (OSError, subprocess.SubprocessError, ValueError):
+        _stt_debug('nonzero-return-code-{}'.format(proc.returncode))
+        return '', []
+    except Exception as exc:
+        _stt_debug('exception-' + type(exc).__name__)
         return '', []
     return '', []
 
@@ -672,17 +713,17 @@ def parse_subtitle(path):
     return '\n'.join(lines)[:30000]
 
 
-def download_public_post(job, config):
+def download_public_post(job, config, sleep_fn=None):
     """Download a public supported post without cookies or login workarounds."""
     url = str(job.get('url') or '')
     if not supported_public_url(url):
-        return None, '지원 사이트가 아니거나 공개 HTTPS 링크가 아닙니다.'
+        return None, _download_error('지원 사이트가 아니거나 공개 HTTPS 링크가 아닙니다.')
     ytdlp = env_value(config, 'LINKCOLLECT_YTDLP_BIN',
         '/home/opc/My_Archive/TELEGRAM_KHSQOWP_LinkCollectbot/tools/yt-dlp-venv/bin/yt-dlp')
     if not Path(ytdlp).is_file():
         ytdlp = shutil.which('yt-dlp') or ''
     if not ytdlp:
-        return None, 'yt-dlp가 설치되지 않았습니다.'
+        return None, _download_error('yt-dlp가 설치되지 않았습니다.')
     dest_dir = MEDIA / 'sources' / re.sub(r'[^a-zA-Z0-9_-]', '', str(job.get('id') or ''))[:32]
     dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(dest_dir, 0o700)
@@ -690,11 +731,23 @@ def download_public_post(job, config):
     command = [ytdlp, '--no-warnings', '--no-progress', '--no-playlist', '--ignore-no-formats-error', '--max-filesize', '128M',
         '--format', 'best', '--write-info-json', '--write-thumbnail', '--write-subs', '--write-auto-subs',
         '--sub-langs', 'ko.*,en.*', '--sub-format', 'vtt/best', '--output', output, '--batch-file', '-']
-    try:
-        proc = subprocess.run(command, input=(url + '\n').encode('utf-8'),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None, '공개 원문 다운로드가 시간 초과 또는 실행 오류로 끝났습니다.'
+    sleep_fn = sleep_fn or __import__('time').sleep
+    proc = None
+    detail_text = ''
+    for attempt, delay in enumerate((0, 30, 90)):
+        if delay:
+            sleep_fn(delay)
+        try:
+            proc = subprocess.run(command, input=(url + '\n').encode('utf-8'),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600, check=False)
+            detail_text = proc.stderr.decode('utf-8', errors='replace') if isinstance(proc.stderr, bytes) else str(proc.stderr or '')
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            proc = None
+            detail_text = type(exc).__name__
+        classification = classify_error(detail_text)
+        if classification != 'transient-rate-limit' or attempt == 2:
+            break
+    failure_returncode = proc.returncode if proc else None
     files = [Path(item) for item in glob.glob(str(dest_dir / '*')) if Path(item).is_file()]
     if not files:
         try:
@@ -710,13 +763,19 @@ def download_public_post(job, config):
                 gallerydl = shutil.which('gallery-dl') or ''
             if gallerydl:
                 try:
-                    subprocess.run([gallerydl, '--config-ignore', '--directory', str(dest_dir), url],
+                    gallery_proc = subprocess.run([gallerydl, '--config-ignore', '--directory', str(dest_dir), url],
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600, check=False)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
+                    gallery_error = gallery_proc.stderr.decode('utf-8', errors='replace') if isinstance(gallery_proc.stderr, bytes) else str(gallery_proc.stderr or '')
+                    if gallery_error:
+                        detail_text = gallery_error
+                    failure_returncode = gallery_proc.returncode
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    detail_text = type(exc).__name__
+                    failure_returncode = None
                 files = [Path(item) for item in glob.glob(str(dest_dir / '*')) if Path(item).is_file()]
         if not files:
-            return None, '사이트에서 공개 미디어를 제공하지 않았거나 로그인이 필요합니다. 접근 제한은 우회하지 않습니다.'
+            message = '사이트에서 공개 미디어를 제공하지 않았거나 로그인이 필요합니다. 접근 제한은 우회하지 않습니다.'
+            return None, _download_error(message, detail_text, failure_returncode)
     info_files = [p for p in files if p.name.endswith('.info.json')]
     info = {}
     if info_files:
@@ -753,13 +812,20 @@ def download_public_post(job, config):
     return result, ''
 
 
+_NAVER_SEARCH_DISABLED = False
+
+
 def naver_geocode(config, address, name='', include_regions=False):
     """Prefer an exact Naver Local Search match for place names, then try address geocoding."""
     region = re.sub(r'\s+', ' ', str(address or '')).strip()
     place_name = re.sub(r'\s+', ' ', str(name or '')).strip()
+    global _NAVER_SEARCH_DISABLED
     search_id = env_value(config, 'LINKCOLLECT_NCP_SEARCH_API_KEY_ID')
     search_key = env_value(config, 'LINKCOLLECT_NCP_SEARCH_API_KEY')
-    if search_id and search_key and place_name:
+    if not (search_id and search_key):
+        search_id = env_value(config, 'LINKCOLLECT_NCP_MAP_API_KEY_ID')
+        search_key = env_value(config, 'LINKCOLLECT_NCP_MAP_API_KEY')
+    if not _NAVER_SEARCH_DISABLED and search_id and search_key and place_name:
         query = ' '.join(x for x in (place_name, region) if x)
         url = 'https://naverapihub.apigw.ntruss.com/search/v1/local?' + urllib.parse.urlencode({'query': query, 'display': 5})
         req = urllib.request.Request(url, headers={
@@ -777,6 +843,9 @@ def naver_geocode(config, address, name='', include_regions=False):
                     if item.get('mapx') and item.get('mapy'):
                         coords = (float(item['mapy']) / 10000000, float(item['mapx']) / 10000000)
                         return (*coords, '', '') if include_regions else coords
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                _NAVER_SEARCH_DISABLED = True
         except Exception:
             pass
     key_id = env_value(config, 'LINKCOLLECT_NCP_MAP_API_KEY_ID')
@@ -1120,7 +1189,7 @@ def analyze_job(job, config):
             try:
                 result['stt_corrected_text'] = correct_transcript_typos(
                     config, transcript,
-                    '\n'.join(part for part in (job.get('source_title'), job.get('extracted_caption')) if part))
+                    '\n'.join(part for part in (job.get('source_title'), job.get('extracted_caption')) if part), job_id=job.get('id', ''))
             except Exception:
                 result['stt_corrected_text'] = ''
         else:
