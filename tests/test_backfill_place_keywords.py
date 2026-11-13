@@ -40,7 +40,14 @@ class BackfillPlaceKeywordsTests(unittest.TestCase):
                 with patch.object(keywords.pipeline, 'api_json', return_value=response):
                     self.assertEqual(keywords.ask_keywords({}, {'name': '가게{%}'}, '원문'), expected)
 
-    def test_api_exception_skips_only_failed_place(self):
+    def test_ask_keywords_payload_omits_response_format(self):
+        response = {'choices': [{'message': {'content': '{"keywords":[]}'} }]}
+        with patch.object(keywords.pipeline, 'api_json', return_value=response) as api_json:
+            keywords.ask_keywords({}, {'name': '가게'}, '원문')
+        payload = api_json.call_args.args[2]
+        self.assertNotIn('response_format', payload)
+
+    def test_api_exception_records_failure_and_continues(self):
         with tempfile.TemporaryDirectory() as td:
             db = sqlite3.connect(os.path.join(td, 'test.sqlite3'))
             db.row_factory = sqlite3.Row
@@ -63,10 +70,16 @@ class BackfillPlaceKeywordsTests(unittest.TestCase):
             output = os.path.join(td, 'proposal.json')
             with patch.object(keywords.pipeline, 'api_json', side_effect=api_json):
                 results = keywords.backfill(db, {}, output)
-            self.assertEqual([item['place_id'] for item in results], ['p2'])
-            self.assertEqual(results[0]['keywords'], ['라떼'])
+            self.assertEqual([item['place_id'] for item in results['proposals']], ['p2'])
+            self.assertEqual(results['proposals'][0]['keywords'], ['라떼'])
+            self.assertEqual(results['errors'][0]['place_id'], 'p1')
+            self.assertEqual(results['errors'][0]['error_type'], 'RuntimeError')
+            self.assertLessEqual(len(results['errors'][0]['message']), 200)
+            self.assertEqual(results['stats'], {'attempted': 2, 'ok': 1, 'failed': 1, 'empty': 0})
             with open(output, encoding='utf-8') as proposal_file:
-                self.assertEqual(json.load(proposal_file)[0]['place_id'], 'p2')
+                payload = json.load(proposal_file)
+                self.assertEqual(payload['proposals'][0]['place_id'], 'p2')
+                self.assertEqual(payload['errors'][0]['place_id'], 'p1')
             db.close()
 
     def test_script_help_works_from_another_cwd(self):

@@ -215,13 +215,13 @@ class PlaceFeatures(unittest.TestCase):
                 return ['크림라떼', '카페', '홍대', '크림라떼']
             out = os.path.join(td, 'proposal.json')
             proposal = backfill(db, {}, out, apply=False, ai_callable=fake_ai)
-            self.assertEqual(proposal[0]['keywords'], ['크림라떼'])
+            self.assertEqual(proposal['proposals'][0]['keywords'], ['크림라떼'])
             self.assertEqual(db.execute("SELECT keywords FROM places WHERE id='p1'").fetchone()[0], '[]')
             applied = backfill(db, {}, out, apply=True, ai_callable=fake_ai)
-            self.assertEqual(applied[0]['keywords'], ['크림라떼'])
+            self.assertEqual(applied['proposals'][0]['keywords'], ['크림라떼'])
             self.assertEqual(json.loads(db.execute("SELECT keywords FROM places WHERE id='p1'").fetchone()[0]), ['크림라떼'])
             self.assertIn('가게A', calls[0][1])
-            self.assertEqual(backfill(db, {}, out, apply=True, ai_callable=fake_ai), [])
+            self.assertEqual(backfill(db, {}, out, apply=True, ai_callable=fake_ai)['proposals'], [])
             db.close()
 
 
