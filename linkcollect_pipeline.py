@@ -20,6 +20,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from place_groups import classify_group
+from place_keywords import validate_keywords
 import glob
 import unicodedata
 from difflib import SequenceMatcher
@@ -95,6 +97,7 @@ def ensure_schema(db):
       -- Legacy default: current persist_result INSERT and UPDATE paths pass category explicitly,
       -- including '' when no usable AI topic exists; retained to avoid a risky SQLite rebuild.
       category TEXT NOT NULL DEFAULT 'place', latitude REAL, longitude REAL,
+      category_group TEXT NOT NULL DEFAULT '기타', keywords TEXT NOT NULL DEFAULT '[]',
       geocode_status TEXT NOT NULL DEFAULT 'pending', geocode_attempted_at TEXT NOT NULL DEFAULT '',
       map_provider TEXT NOT NULL DEFAULT 'naver', naver_map_url TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -125,6 +128,11 @@ def ensure_schema(db):
         if column not in place_columns:
             sql_type = "INTEGER NOT NULL DEFAULT 0" if column == 'hidden' else "TEXT NOT NULL DEFAULT ''"
             db.execute(f"ALTER TABLE places ADD COLUMN {column} {sql_type}")
+    place_columns = {row[1] for row in db.execute('PRAGMA table_info(places)')}
+    if 'category_group' not in place_columns:
+        db.execute("ALTER TABLE places ADD COLUMN category_group TEXT NOT NULL DEFAULT '기타'")
+    if 'keywords' not in place_columns:
+        db.execute("ALTER TABLE places ADD COLUMN keywords TEXT NOT NULL DEFAULT '[]'")
     for row in db.execute("SELECT id,address,region_sido,region_sigungu FROM places").fetchall():
         sido, sigungu = derive_region_tags(row['address'])
         if (row['region_sido'], row['region_sigungu']) != (sido, sigungu):
@@ -555,7 +563,8 @@ def request_analysis(config, text, image_paths, video_frames, transcript, ocr=''
                  'location.category와 각 places 항목의 category는 24시간카페, 디저트카페, 작업카페, 뷰카페, 노원구맛집처럼 해시태그다운 짧고 구체적인 복합명사로 공백 없이 간결하게 쓰고, "홍대 24시간 카페 추천" 같은 긴 표현은 추천·소개·베스트 등 군더더기를 버리고 핵심 주제인 "24시간카페"로 압축하며 "OO구 맛집"·"OO동 맛집"은 "OO구맛집"·"OO동맛집"으로 정규화한다. 캡션·OCR·전사에 뒷받침되는 주제 표현이 없으면 대표 메뉴(예: 크로플, 수제버거)를 쓰고 주제를 지어내거나 장소·카페·맛집만 단독으로 쓰지 않는다. '
                  'JSON 필드: structure_type, title, content_type(information|place|mixed|other), category(development|security|investment|fashion_beauty|other), '
                  'summary, cleaned_content, tags(문자열 배열 최대 12개), language, confidence(0~1), places(장소 배열, 없으면 []), '
-                 'location(객체 또는 null; name,address,category). 입력 캡션:\n{}\n\n화면 OCR:\n{}\n\n음성 전사:\n{}').format(text[:16000], ocr[:20000], transcript[:20000])}]
+                 'location(객체 또는 null; name,address,category,keywords). 각 장소의 keywords는 근거가 있는 대표 메뉴·특징 최대 6개 문자열 배열로 쓰고, 없으면 []. 장소 유형·지역명은 keywords에 넣지 않는다. '
+                 '각 places 항목에도 keywords를 추가한다. 입력 캡션:\n{}\n\n화면 OCR:\n{}\n\n음성 전사:\n{}').format(text[:16000], ocr[:20000], transcript[:20000])}]
     for path in image_paths:
         image = image_content(path)
         if image:
@@ -922,11 +931,11 @@ def persist_result(db, job, analysis, transcript, config):
                 continue
             name = text_value(item.get('name'), 300).strip()
             if name:
-                place_candidates.append((name, text_value(item.get('address_or_region'), 500).strip(), text_value(item.get('category'), 50).strip()))
+                place_candidates.append((name, text_value(item.get('address_or_region'), 500).strip(), text_value(item.get('category'), 50).strip(), validate_keywords(item.get('keywords'), name, item.get('address_or_region'), item.get('category'))))
         if not place_candidates and location_name:
-            place_candidates.append((location_name, location_address, str((location or {}).get('category') or '')[:50].strip()))
+            place_candidates.append((location_name, location_address, str((location or {}).get('category') or '')[:50].strip(), validate_keywords((location or {}).get('keywords'), location_name, location_address, (location or {}).get('category'))))
     elif location_name and content_type in ('place', 'mixed'):
-        place_candidates.append((location_name, location_address, str((location or {}).get('category') or '')[:50].strip()))
+        place_candidates.append((location_name, location_address, str((location or {}).get('category') or '')[:50].strip(), validate_keywords((location or {}).get('keywords'), location_name, location_address, (location or {}).get('category'))))
     if structure_type == 'place_list':
         summary = '장소 목록 {}곳 정리됨'.format(len(place_candidates))
         analysis['summary'] = summary
@@ -935,7 +944,7 @@ def persist_result(db, job, analysis, transcript, config):
     previous_place_ids = [row['place_id'] for row in db.execute('SELECT place_id FROM place_sources WHERE job_id=?', (job['id'],)).fetchall()]
     db.execute('DELETE FROM place_sources WHERE job_id=?', (job['id'],))
     if place_candidates:
-        for place_name, place_address, place_category in place_candidates:
+        for place_name, place_address, place_category, place_keywords in place_candidates:
             address = place_address or place_name
             geocode = naver_geocode(config, address, place_name, include_regions=True)
             coords = geocode[:2] if geocode else None
@@ -944,7 +953,7 @@ def persist_result(db, job, analysis, transcript, config):
                 region_sido, region_sigungu = derive_region_tags(address)
             digest = normalized_hash(place_name, place_address)
             naver_url = 'https://map.naver.com/p/search/' + urllib.parse.quote(address)
-            existing = db.execute('SELECT id,category,latitude,longitude,geocode_status FROM places WHERE dedupe_hash=?', (digest,)).fetchone()
+            existing = db.execute('SELECT id,category,latitude,longitude,geocode_status,keywords FROM places WHERE dedupe_hash=?', (digest,)).fetchone()
             if not existing:
                 # Exact-hash lookup misses when the AI rephrases a vague region string between
                 # re-analyses of the same venue (e.g. "잠실" vs "잠실·송파"). Fall back to a
@@ -971,17 +980,19 @@ def persist_result(db, job, analysis, transcript, config):
             if existing:
                 place_id = existing['id']
                 new_category = place_category if place_category else existing['category']
+                new_group = classify_group(place_name, new_category)
+                new_keywords = place_keywords or json.loads(existing['keywords'] or '[]')
                 if coords:
-                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,category=?,latitude=?,longitude=?,region_sido=?,region_sigungu=?,geocode_status='resolved',geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
-                               (place_name, place_address, digest, new_category, coords[0], coords[1], region_sido, region_sigungu, analyzed_at, naver_url, analyzed_at, place_id))
+                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,category=?,category_group=?,keywords=?,latitude=?,longitude=?,region_sido=?,region_sigungu=?,geocode_status='resolved',geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
+                               (place_name, place_address, digest, new_category, new_group, json.dumps(new_keywords, ensure_ascii=False), coords[0], coords[1], region_sido, region_sigungu, analyzed_at, naver_url, analyzed_at, place_id))
                 else:
                     status = 'resolved' if existing['latitude'] is not None and existing['longitude'] is not None else 'no_result'
-                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,category=?,geocode_status=?,geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
-                               (place_name, place_address, digest, new_category, status, analyzed_at, naver_url, analyzed_at, place_id))
+                    db.execute("UPDATE places SET name=?,address=?,dedupe_hash=?,category=?,category_group=?,keywords=?,geocode_status=?,geocode_attempted_at=?,naver_map_url=?,updated_at=? WHERE id=?",
+                               (place_name, place_address, digest, new_category, new_group, json.dumps(new_keywords, ensure_ascii=False), status, analyzed_at, naver_url, analyzed_at, place_id))
             else:
                 place_id = uuid.uuid4().hex[:16]
-                db.execute('''INSERT INTO places(id,dedupe_hash,name,address,category,latitude,longitude,region_sido,region_sigungu,geocode_status,geocode_attempted_at,map_provider,naver_map_url,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (place_id, digest, place_name, place_address, place_category, coords[0] if coords else None,
+                db.execute('''INSERT INTO places(id,dedupe_hash,name,address,category,category_group,keywords,latitude,longitude,region_sido,region_sigungu,geocode_status,geocode_attempted_at,map_provider,naver_map_url,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (place_id, digest, place_name, place_address, place_category, classify_group(place_name, place_category), json.dumps(place_keywords, ensure_ascii=False), coords[0] if coords else None,
                     coords[1] if coords else None, region_sido, region_sigungu, 'resolved' if coords else 'no_result', analyzed_at, 'naver', naver_url, analyzed_at, analyzed_at))
             db.execute('INSERT OR IGNORE INTO place_sources(place_id,job_id) VALUES(?,?)', (place_id, job['id']))
     for tag in clean_tags(analysis.get('tags')):
