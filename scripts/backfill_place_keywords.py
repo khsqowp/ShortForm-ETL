@@ -30,7 +30,7 @@ def gather_source(db, place_id, place_name):
 
 
 def build_prompt(place, source_text):
-    return ('이 자료는 게시물 여러 장소 중 특정 장소 하나의 원문이다. 대상 장소 이름과 직접 연결되는 메뉴 또는 특징만 최대 6개 추출하라. 다른 장소의 메뉴를 섞지 말고, 근거가 없으면 빈 배열을 출력하라. 장소 유형과 지역명은 제외한다. JSON 객체만 출력한다. 형식: {"keywords":["메뉴"]}\n\n대상 장소: '
+    return ('자료에는 여러 장소가 함께 나올 수 있다. 대상 장소 이름이 적힌 항목에 직접 연결된 메뉴나 고유한 시설·경험 특징만 최대 6개 추출하라. 원문에 실제로 적힌 표현만 사용하고, 한 단어라도 근거가 없으면 넣지 않는다. 메뉴명(드립커피, 마들렌, 케이크), 식별력 있는 특징(루프탑, 한강 뷰, LP 음악)은 허용한다. 장소 유형·홍대·한강 같은 지역명 단독, 놀거리·볼거리·복합문화공간·카페·맛집·책방, 좌석·책상·콘센트·노트북 작업 같은 일반 정보, 추측·중복·다른 장소의 정보를 제외한다. 한강 뷰/한강뷰/한강 전망처럼 뜻이 겹치면 한 표현만 남긴다. 대상 장소에 직접 연결된 근거가 없으면 빈 배열을 출력한다. JSON 객체만 출력한다. 형식: {"keywords":["드립커피"]}\n\n대상 장소: '
             + str(place['name']) + '\n자료:\n' + str(source_text))
 
 
@@ -97,7 +97,7 @@ def backfill(db, config, out_path, apply=False, limit=None, place_id=None, ai_ca
             errors.append({'place_id': place['id'], 'error_type': type(exc).__name__,
                            'message': _safe_error_message(exc)})
             continue
-        keywords = validate_keywords(raw, place['name'], place['address'], place['category'])
+        keywords = validate_keywords(raw, place['name'], place['address'], place['category'], source)
         proposals.append({'place_id': place['id'], 'name': place['name'], 'keywords': keywords})
         if not keywords:
             empty += 1

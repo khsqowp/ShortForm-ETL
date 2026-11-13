@@ -23,7 +23,7 @@ class BackfillPlaceKeywordsTests(unittest.TestCase):
         place = {'name': "가게{% 메뉴}"}
         source = '원문 {"quoted": "value"} and \'single quotes\' and "double quotes"'
         prompt = keywords.build_prompt(place, source)
-        self.assertIn('형식: {"keywords":["메뉴"]}', prompt)
+        self.assertIn('형식: {"keywords":["드립커피"]}', prompt)
         self.assertIn("대상 장소: 가게{% 메뉴}", prompt)
         self.assertTrue(prompt.endswith(source))
 
@@ -58,7 +58,7 @@ class BackfillPlaceKeywordsTests(unittest.TestCase):
             for place_id, name in [('p1', '실패장소'), ('p2', '성공장소')]:
                 db.execute('INSERT INTO places VALUES(?,?,?,?,?,0)', (place_id, name, '주소', '식당', '[]'))
                 job_id = 'j' + place_id
-                db.execute('INSERT INTO jobs VALUES(?,?,?)', (job_id, 'now', '원문'))
+                db.execute('INSERT INTO jobs VALUES(?,?,?)', (job_id, 'now', '라떼 원문'))
                 db.execute('INSERT INTO place_sources VALUES(?,?)', (place_id, job_id))
 
             response = {'choices': [{'message': {'content': '{"keywords":["라떼"]}'}}]}
